@@ -1,5 +1,120 @@
-# SafeDiscLoader2
-Allows playing SafeDisc (version 2.0 to the latest 4.9) protected games on modern Windows without the need of the CD/DVD. 
+# Valkyria Chronicles 3 中文化补丁
+
+这是面向中文用户的 Valkyria Chronicles 3（WSC3，工程目录名为 `KH3`）运行时汉化补丁基准工程。
+
+## 项目说明
+
+本仓库保存 Valkyria Chronicles 3（WSC3）方案一运行时汉化补丁的基准源码。
+
+补丁保留 SafeDiscLoader2 的 `version.dll` 代理和兼容逻辑，并加入：
+
+- CP932（日文 Shift-JIS）原始字节识别；
+- 中文翻译表查找；
+- `DrawTextA` / `DrawTextW` 文字拦截；
+- 中文宽字符绘制；
+- 254、260、328 宽度的段落重排；
+- 旧版段落重排回退逻辑；
+- WSC3 UI Debug 调试窗口和翻译保存功能。
+
+完整复现说明请阅读：[方案一-完整复现与维护说明.md](方案一-完整复现与维护说明.md)。
+
+## 快速使用
+
+将构建后的 `version.dll` 放到游戏 EXE 所在目录。当前测试目录为：
+
+    E:\\KH3
+
+翻译表放在：
+
+    E:\\KH3\\chinese\\translations.json
+
+`version.json` 也放在游戏目录中，用于控制日志、汉化补丁和 Debug UI。
+
+SafeDisc 3 及以上版本通常会自动加载同目录下的 `version.dll`。部分 SafeDisc 2 游戏需要使用 `VersionInjector.exe` 注入；可以双击运行，也可以将游戏 EXE 拖到该程序上。
+
+## 方案一运行逻辑
+
+方案一不修改游戏 EXE，也不修改原始游戏文本文件：
+
+    游戏文字调用
+        ↓
+    DrawTextA / DrawTextW Hook
+        ↓
+    用原始 CP932 字节识别文本
+        ↓
+    查找 chinese\\translations.json
+        ↓
+    有翻译：用中文宽字符绘制
+    无翻译：显示原文
+        ↓
+    对完整段落进行重排并抑制重复日文行
+
+原始文本身份仍然是 CP932。CP936 和宽字符只负责显示中文，不能代替原始文本身份，否则会导致翻译键无法稳定匹配。
+
+## 翻译表
+
+翻译表路径：
+
+    E:\\KH3\\chinese\\translations.json
+
+普通静态文本示例：
+
+    {
+      "hash": "DE23B78B",
+      "text": "战舰",
+      "source": ""
+    }
+
+只有确实存在变量时才使用 `{0}`、`{1}` 等模板占位符。不能把所有数字自动视为变量，因为玩家输入的数字也可能是名称。
+
+普通记录的 `source` 保持为空，只有模板记录保存 `source`，以避免翻译表无意义地膨胀。
+
+## 段落补丁
+
+当前支持的历史文字框宽度为：
+
+    254
+    260
+    328
+
+游戏通常先以宽度 0 测量完整段落，再以窄框逐行绘制。补丁缓存完整段落，优先进行历史调用回放；严格路径不匹配时，继续使用旧版通用段落重排逻辑。
+
+因此，即使没有任何中文翻译，日文原文也应经过同样的段落修正。
+
+## 从源码构建
+
+要求：Windows、Visual Studio 2022 或 Build Tools、Win32/x86 C++ 工具链。
+
+在 `SafeDiscLoader2` 目录执行：
+
+    MSBuild.exe .\\version-proxy.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /p:WholeProgramOptimization=false /m:1 /v:minimal
+
+输出文件：
+
+    Release\\version.dll
+
+构建和部署前请保存原 DLL。不要同时加载多个版本的 `version.dll` 或 `kh3_gbk.dll`。
+
+## 重要文件
+
+| 文件 | 用途 |
+|---|---|
+| `src/UiDiag.cpp` | 编码转换、翻译表、Debug UI、文字 Hook、段落重排 |
+| `src/version.cpp` | version.dll 代理、SafeDisc 初始化、配置读取和 Hook 安装 |
+| `tests/` | 段落补丁和 Hook ABI 契约测试 |
+| `方案一-完整复现与维护说明.md` | 完整复现、维护和故障排查 |
+| `基准构建记录.md` | 基准 DLL、哈希和部署记录 |
+
+## 安全和许可证
+
+本项目面向拥有正版游戏的用户，用于个人兼容性、维护和合理使用。仓库不包含游戏本体、游戏资源、运行日志、API 密钥、内存镜像或旧版 DLL 备份。
+
+某些杀毒软件可能会把 DLL Hook 或代码注入误报为风险行为，请先确认源码和构建过程，再根据自己的安全策略决定是否运行。
+
+本仓库保留原 SafeDiscLoader2 的 GPL-3.0 许可证。
+
+<details>
+<summary>原 SafeDiscLoader2 英文资料（展开查看）</summary>
 
 ## Valkyria Chronicles 3 Chinese patch baseline
 
@@ -78,3 +193,5 @@ Find out more here: [Example Config Files](https://github.com/nckstwrt/SafeDiscL
 
 > [!CAUTION]
 > Antivirus software that blocks code injection could block this dll or loader, so make sure to greenlist the included exe and dll or disable your antivirus software if required.
+
+</details>
