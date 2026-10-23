@@ -30,6 +30,12 @@
 
 `version.json` 也放在游戏目录中，用于控制日志、汉化补丁和 Debug UI。
 
+现代中文 Windows 上还应启用进程内 CP932 兼容层。可将仓库中的
+`version.capture.json` 复制为游戏目录的 `version.json`；该示例已经关闭日志和舰船诊断追踪，并保留：
+
+    "uiTextEncoding": "cp932",
+    "uiForceCp932": true
+
 SafeDisc 3 及以上版本通常会自动加载同目录下的 `version.dll`。部分 SafeDisc 2 游戏需要使用 `VersionInjector.exe` 注入；可以双击运行，也可以将游戏 EXE 拖到该程序上。
 
 ## 方案一运行逻辑
@@ -50,6 +56,14 @@ SafeDisc 3 及以上版本通常会自动加载同目录下的 `version.dll`。�
     对完整段落进行重排并抑制重复日文行
 
 原始文本身份仍然是 CP932。CP936 和宽字符只负责显示中文，不能代替原始文本身份，否则会导致翻译键无法稳定匹配。
+
+## 系统区域兼容修复
+
+游戏原版按日文非 Unicode 程序环境运行，依赖 CP932。中文系统通常使用 CP936，可能导致部分资源或舰船数据加载失败，最终在游戏内部出现空表项并闪退。
+
+`uiForceCp932=true` 只对游戏进程模拟 CP932：让 `GetACP()`、`GetOEMCP()` 返回 932，并将 `CP_ACP` 转换按 CP932 处理。它不修改游戏 EXE、原始资源或翻译表，也不改变中文显示链路。
+
+该兼容层已经在中文系统区域下验证可修复完成舰购买闪退；如果改用日文系统区域，可关闭该选项进行对照测试。
 
 ## 翻译表
 
@@ -87,11 +101,17 @@ SafeDisc 3 及以上版本通常会自动加载同目录下的 `version.dll`。�
 
 在 `SafeDiscLoader2` 目录执行：
 
-    MSBuild.exe .\\version-proxy.vcxproj /t:Rebuild /p:Configuration=Release /p:Platform=Win32 /p:PlatformToolset=v143 /p:WholeProgramOptimization=false /m:1 /v:minimal
+    .\\build-release.ps1
+
+脚本会调用 Win32/v143 MSBuild，完成重建并输出 DLL 的 SHA-256。也可以按脚本中的命令手动构建。
 
 输出文件：
 
     Release\\version.dll
+
+运行全部源码契约测试：
+
+    Get-ChildItem .\\tests\\*.ps1 | ForEach-Object { & $_.FullName }
 
 构建和部署前请保存原 DLL。不要同时加载多个版本的 `version.dll` 或 `kh3_gbk.dll`。
 
@@ -104,10 +124,13 @@ SafeDisc 3 及以上版本通常会自动加载同目录下的 `version.dll`。�
 | `tests/` | 段落补丁和 Hook ABI 契约测试 |
 | `方案一-完整复现与维护说明.md` | 完整复现、维护和故障排查 |
 | `基准构建记录.md` | 基准 DLL、哈希和部署记录 |
+| `更新说明-CP932区域兼容修复.md` | 本次中文系统区域闪退修复说明 |
+| `version.capture.json` | 已关闭日志的可部署配置示例 |
+| `build-release.ps1` | 一键重建 Release DLL 并输出 SHA-256 |
 
 ## 安全和许可证
 
-本项目面向拥有正版游戏的用户，用于个人兼容性、维护和合理使用。仓库不包含游戏本体、游戏资源、运行日志、API 密钥、内存镜像或旧版 DLL 备份。
+本项目面向拥有正版游戏的用户，用于个人兼容性、维护和合理使用。仓库不包含游戏本体、游戏资源、运行日志、API 密钥、内存镜像或旧版 DLL 备份。`dist/version.dll` 是由本仓库源码构建的当前发布产物，不是游戏文件。
 
 某些杀毒软件可能会把 DLL Hook 或代码注入误报为风险行为，请先确认源码和构建过程，再根据自己的安全策略决定是否运行。
 

@@ -6,4 +6,6 @@
 bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnly = false,
     bool doubleTargetWidth = false, bool narrowTargetFont = false, int targetFontScalePercent = 100,
     bool reflowTargetText = false, bool patchOnly = false, bool patchTrace = false,
-    bool debugWindow = false, UINT patchTextCodePage = 936);
+    bool debugWindow = false, UINT patchTextCodePage = 936,
+    bool originalNullGuard = false, bool captureShipData = false,
+    bool forceSystemCp932 = false);

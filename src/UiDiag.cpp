@@ -45,6 +45,10 @@ namespace
     bool g_reflowTargetText = false;
     bool g_patchOnly = false;
     bool g_patchTrace = false;
+    bool g_captureShipData = false;
+    bool g_forceSystemCp932 = false;
+    volatile LONG g_originalNullGuardRetryPending = 0;
+    volatile LONG g_shipLookupHookInstalled = 0;
     UINT g_patchTextCodePage = 936;
     bool g_debugWindowEnabled = false;
     HWND g_debugWindow = nullptr;
@@ -74,6 +78,8 @@ namespace
     __declspec(thread) bool g_inHook = false;
 
     using GetSystemMetricsFn = int (WINAPI*)(int);
+    using GetACPFn = UINT (WINAPI*)();
+    using GetOEMCPFn = UINT (WINAPI*)();
     using GetDeviceCapsFn = int (WINAPI*)(HDC, int);
     using GetClientRectFn = BOOL (WINAPI*)(HWND, LPRECT);
     using TextOutAFn = BOOL (WINAPI*)(HDC, int, int, LPCSTR, int);
@@ -82,6 +88,7 @@ namespace
     using GetTextExtentPoint32WFn = BOOL (WINAPI*)(HDC, LPCWSTR, int, LPSIZE);
     using DrawTextAFn = int (WINAPI*)(HDC, LPCSTR, int, LPRECT, UINT);
     using DrawTextWFn = int (WINAPI*)(HDC, LPCWSTR, int, LPRECT, UINT);
+    using ShipLookupFn = int (__thiscall*)(void*, int, int);
     using MultiByteToWideCharFn = int (WINAPI*)(UINT, DWORD, LPCCH, int, LPWSTR, int);
     using CreateFontAFn = HFONT (WINAPI*)(int, int, int, int, int, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, DWORD, LPCSTR);
     using CreateFontIndirectAFn = HFONT (WINAPI*)(const LOGFONTA*);
@@ -96,6 +103,8 @@ namespace
         HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice8**);
 
     GetSystemMetricsFn g_getSystemMetrics = nullptr;
+    GetACPFn g_getACP = nullptr;
+    GetOEMCPFn g_getOEMCP = nullptr;
     GetDeviceCapsFn g_getDeviceCaps = nullptr;
     GetClientRectFn g_getClientRect = nullptr;
     TextOutAFn g_textOutA = nullptr;
@@ -104,6 +113,7 @@ namespace
     GetTextExtentPoint32WFn g_getTextExtentW = nullptr;
     DrawTextAFn g_drawTextA = nullptr;
     DrawTextWFn g_drawTextW = nullptr;
+    ShipLookupFn g_shipLookupOriginal = nullptr;
     MultiByteToWideCharFn g_multiByteToWideChar = nullptr;
     CreateFontAFn g_createFontA = nullptr;
     CreateFontIndirectAFn g_createFontIndirectA = nullptr;
@@ -161,6 +171,10 @@ namespace
     constexpr int kDebugCopyCurrentButton = 1011;
 
     std::string CopyWideText(LPCWSTR text, int count);
+    std::string CopyAnsiHex(LPCSTR text, int count);
+    void CaptureShipTextA(LPCSTR text, int count, LPRECT rect, UINT format,
+        uintptr_t caller, LPCWSTR original, int originalCount,
+        LPCWSTR rendered, int renderedCount, uint32_t key);
 
     int HistorySlotAtDisplayIndexLocked(int index)
     {
@@ -610,6 +624,198 @@ namespace
     constexpr uintptr_t kParagraphMeasureCaller = 0x0049B324;
     constexpr uintptr_t kParagraphDrawCaller = 0x0049B9F0;
 
+    // WSC3 1.1.0.3: when the completed-ship path has no ship table, the
+    // original code branches to 004B042E and dereferences EDX+0x2B0 while
+    // EDX is null.  004B0445 is the existing ret 8 path for this routine.
+    constexpr uintptr_t kOriginalNullGuardRva = 0x000B041D;
+    constexpr BYTE kOriginalNullGuardOriginalByte = 0x10;
+    constexpr BYTE kOriginalNullGuardPatchedByte = 0x27;
+
+    bool ApplyOriginalNullGuard(bool enabled, bool quietUnexpected = false)
+    {
+        if (!enabled)
+            return false;
+
+        char modulePath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, modulePath, ARRAYSIZE(modulePath));
+        const char* fileName = strrchr(modulePath, '\\');
+        fileName = fileName ? fileName + 1 : modulePath;
+        if (_stricmp(fileName, "wsc3.exe") != 0)
+            return false;
+
+        BYTE* patch = reinterpret_cast<BYTE*>(
+            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) +
+            kOriginalNullGuardRva);
+        if (!patch || *patch != kOriginalNullGuardOriginalByte)
+        {
+            if (!quietUnexpected)
+                log("[ORIGFIX] null guard skipped: unexpected byte at RVA 0x%08lX\n",
+                    static_cast<unsigned long>(kOriginalNullGuardRva));
+            return false;
+        }
+
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(patch, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
+        {
+            log("[ORIGFIX] null guard VirtualProtect failed: %lu\n", GetLastError());
+            return false;
+        }
+        *patch = kOriginalNullGuardPatchedByte;
+        FlushInstructionCache(GetCurrentProcess(), patch, 1);
+        DWORD ignored = 0;
+        VirtualProtect(patch, 1, oldProtect, &ignored);
+        log("[ORIGFIX] null guard enabled: RVA=0x%08lX byte=0x%02X\n",
+            static_cast<unsigned long>(kOriginalNullGuardRva),
+            static_cast<unsigned int>(*patch));
+        return true;
+    }
+
+    constexpr uintptr_t kShipLookupRva = 0x000B03F0;
+    constexpr LONG kMaxShipTraceLines = 256;
+
+    struct ShipTraceSignature
+    {
+        uintptr_t caller = 0;
+        int arg1 = 0;
+        int index = 0;
+        DWORD root = 0;
+        DWORD slot = 0;
+        DWORD value = 0;
+    };
+
+    ShipTraceSignature g_shipTraceSeen[kMaxShipTraceLines] = {};
+    volatile LONG g_shipTraceSeenCount = 0;
+
+    bool SameShipTraceSignature(const ShipTraceSignature& left,
+        const ShipTraceSignature& right)
+    {
+        return left.caller == right.caller &&
+            left.arg1 == right.arg1 &&
+            left.index == right.index &&
+            left.root == right.root &&
+            left.slot == right.slot &&
+            left.value == right.value;
+    }
+
+    bool ReserveNewShipTrace(const ShipTraceSignature& signature)
+    {
+        LONG count = InterlockedCompareExchange(&g_shipTraceSeenCount, 0, 0);
+        if (count >= kMaxShipTraceLines)
+            return false;
+
+        for (LONG i = 0; i < count; ++i)
+        {
+            if (SameShipTraceSignature(g_shipTraceSeen[i], signature))
+                return false;
+        }
+
+        const LONG slot = InterlockedIncrement(&g_shipTraceSeenCount) - 1;
+        if (slot < 0 || slot >= kMaxShipTraceLines)
+            return false;
+        g_shipTraceSeen[slot] = signature;
+        return true;
+    }
+
+    bool ReadDwordSafe(uintptr_t address, DWORD* value)
+    {
+        if (!value || address == 0)
+            return false;
+        __try
+        {
+            *value = *reinterpret_cast<const DWORD*>(address);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            *value = 0;
+            return false;
+        }
+    }
+
+    int __fastcall HookShipLookup(void* self, void*, int arg1, int index)
+    {
+        DWORD root = 0;
+        DWORD previousIndex = 0;
+        DWORD slot = 0;
+        DWORD value = 0;
+        const uintptr_t selfAddress = reinterpret_cast<uintptr_t>(self);
+        ReadDwordSafe(selfAddress + 0x08, &root);
+        ReadDwordSafe(selfAddress + 0x10, &previousIndex);
+        if (root != 0 && index >= 0 && index <= 0x100000)
+        {
+            slot = static_cast<DWORD>(root +
+                static_cast<uintptr_t>(index) * 0x81u + 0x200u);
+            ReadDwordSafe(slot, &value);
+        }
+        const uintptr_t caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+        const ShipTraceSignature signature = {
+            caller, arg1, index, root, slot, value
+        };
+        if (ReserveNewShipTrace(signature))
+        {
+            g_inHook = true;
+            log("[SHIPDATA] caller=0x%08lX self=0x%08lX arg1=%d index=%d self10=0x%08lX root=0x%08lX slot=0x%08lX value=0x%08lX\n",
+                static_cast<unsigned long>(caller),
+                static_cast<unsigned long>(selfAddress), arg1, index,
+                static_cast<unsigned long>(previousIndex),
+                static_cast<unsigned long>(root), static_cast<unsigned long>(slot),
+                static_cast<unsigned long>(value));
+            g_inHook = false;
+        }
+        return g_shipLookupOriginal
+            ? g_shipLookupOriginal(self, arg1, index) : 0;
+    }
+
+    void InstallShipLookupHook()
+    {
+        if (!g_captureShipData ||
+            InterlockedCompareExchange(&g_shipLookupHookInstalled, 0, 0) != 0)
+            return;
+
+        if (InterlockedCompareExchange(&g_shipLookupHookInstalled, 1, 0) != 0)
+            return;
+
+        char modulePath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, modulePath, ARRAYSIZE(modulePath));
+        const char* fileName = strrchr(modulePath, '\\');
+        fileName = fileName ? fileName + 1 : modulePath;
+        if (_stricmp(fileName, "wsc3.exe") != 0)
+        {
+            InterlockedExchange(&g_shipLookupHookInstalled, 3);
+            return;
+        }
+
+        BYTE* target = reinterpret_cast<BYTE*>(
+            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) + kShipLookupRva);
+        const BYTE expected[] = {
+            0x8B, 0x44, 0x24, 0x08, 0x8B, 0x51, 0x10, 0x3B, 0xC2, 0x74, 0x4A
+        };
+        if (!target || memcmp(target, expected, sizeof(expected)) != 0)
+        {
+            log("[SHIPDATA] hook skipped: unexpected bytes at RVA 0x%08lX\n",
+                static_cast<unsigned long>(kShipLookupRva));
+            InterlockedExchange(&g_shipLookupHookInstalled, 3);
+            return;
+        }
+
+        MH_STATUS createStatus = MH_CreateHook(target,
+            reinterpret_cast<LPVOID>(&HookShipLookup),
+            reinterpret_cast<LPVOID*>(&g_shipLookupOriginal));
+        MH_STATUS enableStatus = createStatus == MH_OK
+            ? MH_EnableHook(target) : createStatus;
+        if (enableStatus != MH_OK)
+        {
+            log("[SHIPDATA] hook failed: create=%d enable=%d\n",
+                static_cast<int>(createStatus), static_cast<int>(enableStatus));
+            InterlockedExchange(&g_shipLookupHookInstalled, 3);
+            return;
+        }
+
+        InterlockedExchange(&g_shipLookupHookInstalled, 2);
+        log("[SHIPDATA] hook enabled: RVA=0x%08lX\n",
+            static_cast<unsigned long>(kShipLookupRva));
+    }
+
     bool IsHistoricalParagraphMeasure(uintptr_t caller)
     {
         return caller == 0 || caller == kParagraphMeasureCaller;
@@ -1057,6 +1263,8 @@ namespace
     {
         if (!g_multiByteToWideChar)
             return 0;
+        if (g_forceSystemCp932 && codePage == CP_ACP)
+            codePage = 932;
         if (g_patchOnly && g_patchTextCodePage == 936 &&
             (codePage == CP_ACP || codePage == 932) &&
             HasHighByte(text, count))
@@ -1152,6 +1360,12 @@ namespace
     int WINAPI HookDrawTextPatch(HDC dc, LPCSTR text, int count, LPRECT rect,
         UINT format)
     {
+        if (InterlockedCompareExchange(&g_originalNullGuardRetryPending, 0, 0) != 0 &&
+            ApplyOriginalNullGuard(true, true))
+        {
+            InterlockedExchange(&g_originalNullGuardRetryPending, 0);
+        }
+        InstallShipLookupHook();
         if (g_patchTrace)
             log("[PATCHTRACE][A] count=%d format=0x%08X width=%ld top=%ld\n", count, format,
                 rect ? rect->right - rect->left : -1L, rect ? rect->top : -1L);
@@ -1205,6 +1419,9 @@ namespace
             converted[copy] = L'\0';
             convertedCount = copy;
         }
+
+        CaptureShipTextA(text, actualCount, rect, format, callerAddress,
+            originalText, originalCount, converted, convertedCount, originalKey);
 
         int replayResult = 0;
         if (ReplayHistoricalPatchParagraph(dc, text, actualCount, rect, format,
@@ -1285,6 +1502,12 @@ namespace
 
     int WINAPI HookDrawTextWPatch(HDC dc, LPCWSTR text, int count, LPRECT rect, UINT format)
     {
+        if (InterlockedCompareExchange(&g_originalNullGuardRetryPending, 0, 0) != 0 &&
+            ApplyOriginalNullGuard(true, true))
+        {
+            InterlockedExchange(&g_originalNullGuardRetryPending, 0);
+        }
+        InstallShipLookupHook();
         if (g_patchTrace)
             log("[PATCHTRACE][W] count=%d format=0x%08X width=%ld top=%ld\n", count, format,
                 rect ? rect->right - rect->left : -1L, rect ? rect->top : -1L);
@@ -1484,6 +1707,26 @@ namespace
         return result;
     }
 
+    void CaptureShipTextA(LPCSTR text, int count, LPRECT rect, UINT format,
+        uintptr_t caller, LPCWSTR original, int originalCount,
+        LPCWSTR rendered, int renderedCount, uint32_t key)
+    {
+        if (!g_captureShipData || !text || count <= 0 || count > 128 || !rect ||
+            rect->right - rect->left < 20 || rect->right - rect->left > 240 ||
+            rect->top < 0 || rect->top > 240 || g_inHook)
+            return;
+
+        const std::string rawHex = CopyAnsiHex(text, count);
+        const std::string cp932Text = CopyWideText(original, originalCount);
+        const std::string renderedText = CopyWideText(rendered, renderedCount);
+        g_inHook = true;
+        log("[SHIPTRACE][A] caller=0x%08lX count=%d format=0x%08X rect=%ld,%ld,%ld,%ld key=%08X raw_hex=\"%s\" cp932=\"%s\" rendered=\"%s\"\n",
+            static_cast<unsigned long>(caller), count, format,
+            rect->left, rect->top, rect->right, rect->bottom, key,
+            rawHex.c_str(), cp932Text.c_str(), renderedText.c_str());
+        g_inHook = false;
+    }
+
     void LogText(const char* api, int x, int y, int count, const std::string& text)
     {
         if (!g_logText || g_inHook)
@@ -1504,6 +1747,20 @@ namespace
             g_inHook = false;
         }
         return result;
+    }
+
+    UINT WINAPI HookGetACP()
+    {
+        if (g_forceSystemCp932)
+            return 932;
+        return g_getACP ? g_getACP() : 936;
+    }
+
+    UINT WINAPI HookGetOEMCP()
+    {
+        if (g_forceSystemCp932)
+            return 932;
+        return g_getOEMCP ? g_getOEMCP() : 936;
     }
 
     int WINAPI HookGetDeviceCaps(HDC dc, int index)
@@ -1868,10 +2125,13 @@ namespace
 
 bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnly,
     bool doubleTargetWidth, bool narrowTargetFont, int targetFontScalePercent, bool reflowTargetText,
-    bool patchOnly, bool patchTrace, bool debugWindow, UINT patchTextCodePage)
+    bool patchOnly, bool patchTrace, bool debugWindow, UINT patchTextCodePage,
+    bool originalNullGuard, bool captureShipData, bool forceSystemCp932)
 {
     g_patchOnly = patchOnly;
     g_patchTrace = patchTrace;
+    g_captureShipData = captureShipData;
+    g_forceSystemCp932 = forceSystemCp932;
     g_patchTextCodePage = patchTextCodePage == 932 ? 932 : 936;
     g_debugWindowEnabled = debugWindow;
     g_logText = patchOnly ? false : logText;
@@ -1881,6 +2141,10 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
     g_narrowTargetFont = narrowTargetFont;
     g_targetFontScalePercent = targetFontScalePercent > 0 ? targetFontScalePercent : 100;
     g_reflowTargetText = reflowTargetText;
+
+    InterlockedExchange(&g_originalNullGuardRetryPending, originalNullGuard ? 1 : 0);
+    if (originalNullGuard && ApplyOriginalNullGuard(true))
+        InterlockedExchange(&g_originalNullGuardRetryPending, 0);
 
     ResolveTranslationPath();
     LoadTranslations();
@@ -1923,6 +2187,13 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
             reinterpret_cast<LPVOID*>(&g_drawTextW)) && ok;
         ok = AddApiHook(L"kernel32", "MultiByteToWideChar", (LPVOID)&HookMultiByteToWideChar,
             reinterpret_cast<LPVOID*>(&g_multiByteToWideChar)) && ok;
+        if (g_forceSystemCp932)
+        {
+            ok = AddApiHook(L"kernel32", "GetACP", (LPVOID)&HookGetACP,
+                reinterpret_cast<LPVOID*>(&g_getACP)) && ok;
+            ok = AddApiHook(L"kernel32", "GetOEMCP", (LPVOID)&HookGetOEMCP,
+                reinterpret_cast<LPVOID*>(&g_getOEMCP)) && ok;
+        }
     }
     else if (g_logText)
     {

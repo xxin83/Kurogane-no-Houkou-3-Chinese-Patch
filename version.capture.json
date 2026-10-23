@@ -1,0 +1,21 @@
+{
+  "logging": false,
+  "logFile": "E:\\KH3\\version.log.txt",
+  "injectorLogFile": "E:\\KH3\\injector.log",
+  "logCreateFile": false,
+  "uiDiagnostics": true,
+  "uiLogText": false,
+  "uiLogMetrics": false,
+  "uiTargetTextWidthOnly": false,
+  "uiDoubleTargetWidth": false,
+  "uiNarrowTargetFont": false,
+  "uiTargetFontScale": 100,
+  "uiReflowTargetText": true,
+  "uiPatchOnly": true,
+  "uiPatchTrace": false,
+  "uiCaptureShipData": false,
+  "uiOriginalNullGuard": true,
+  "uiDebugWindow": false,
+  "uiTextEncoding": "cp932",
+  "uiForceCp932": true
+}

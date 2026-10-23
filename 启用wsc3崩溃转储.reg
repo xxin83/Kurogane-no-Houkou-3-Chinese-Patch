@@ -1,0 +1,6 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\wsc3.exe]
+"DumpFolder"="C:\\Users\\xiong\\AppData\\Local\\Temp\\wsc3-dumps"
+"DumpCount"=dword:0000000a
+"DumpType"=dword:00000002

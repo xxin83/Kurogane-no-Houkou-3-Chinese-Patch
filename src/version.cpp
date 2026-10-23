@@ -1068,7 +1068,10 @@ DWORD WINAPI Load(LPVOID lpParam)
 			config.GetBool("uiPatchOnly", false),
 			config.GetBool("uiPatchTrace", false),
 			config.GetBool("uiDebugWindow", false),
-			(config.GetValue("uiTextEncoding") && _stricmp(config.GetValue("uiTextEncoding"), "cp932") == 0) ? 932 : 936);
+			(config.GetValue("uiTextEncoding") && _stricmp(config.GetValue("uiTextEncoding"), "cp932") == 0) ? 932 : 936,
+			config.GetBool("uiOriginalNullGuard", true),
+			config.GetBool("uiCaptureShipData", false),
+			config.GetBool("uiForceCp932", false));
 	}
 
 	if ((status = MH_CreateHookApi(L"kernel32", "CreateProcessA", &CreateProcessA_Hook, reinterpret_cast<LPVOID*>(&CreateProcessA_Orig))) != MH_OK)
