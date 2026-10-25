@@ -1,13 +1,13 @@
 $ErrorActionPreference = 'Stop'
 $source = Get-Content -Raw (Join-Path $PSScriptRoot '..\src\UiDiag.cpp')
 
-if ($source -notmatch 'return width == 254 \|\| width == 260 \|\| width == 328;') {
-    throw 'Scheme-two paragraph port must recognize the 260px reflow box.'
+if ($source -notmatch 'return width == 254 \|\| width == 260 \|\| width == 328 \|\| width == 362;') {
+    throw 'Scheme-two paragraph port must recognize the 260px and 362px reflow boxes.'
 }
 if ($source -notmatch 'bool IsLegacyReflowWidth\(LONG width\)' -or
-    $source -notmatch 'return width == 254 \|\| width == 260 \|\| width == 328;' -or
+    $source -notmatch 'return width == 254 \|\| width == 260 \|\| width == 328 \|\| width == 362;' -or
     $source -notmatch 'IsLegacyReflowWidth\(rect->right - rect->left\)') {
-    throw 'Legacy scheme-one reflow must recognize the 254px, 260px, and 328px boxes.'
+    throw 'Legacy scheme-one reflow must recognize the 254px, 260px, 328px, and 362px boxes.'
 }
 if ($source -notmatch 'g_patchParagraphSourceBytes') {
     throw 'Scheme-two paragraph port must retain the original byte sequence.'

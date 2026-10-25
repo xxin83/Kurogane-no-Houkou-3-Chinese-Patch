@@ -6,8 +6,8 @@ if ($source -notmatch '(?s)int WINAPI HookDrawTextPatch\(HDC dc, LPCSTR text, in
 if ($source -match 'HookDrawTextPatchImpl') {
     throw 'Legacy scheme-one reflow must not use the six-parameter implementation wrapper.'
 }
-if ($source -notmatch 'return width == 254 \|\| width == 260 \|\| width == 328;') {
-    throw 'Scheme-one legacy reflow widths must include 254, 260, and 328.'
+if ($source -notmatch 'return width == 254 \|\| width == 260 \|\| width == 328 \|\| width == 362;') {
+    throw 'Scheme-one legacy reflow widths must include 254, 260, 328, and 362.'
 }
 $wHook = [regex]::Match($source, '(?s)int WINAPI HookDrawTextWPatch\(.*?\n    \}\n\n    void ScaleTargetLogfont').Value
 if ($source -match 'FindTranslationWithWidthAlias') {

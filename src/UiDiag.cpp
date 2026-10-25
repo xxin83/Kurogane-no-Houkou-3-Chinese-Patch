@@ -63,6 +63,9 @@ namespace
         // Optional source template.  A template may contain {0}, {1}, ...
         // for dynamic fields that must be copied back unchanged.
         std::wstring source;
+        // Only enabled for templates whose captured values should also be
+        // looked up as independent CP932 translations.
+        bool translateCaptures = false;
     };
     std::vector<TranslationEntry> g_translations;
     struct DecodeAlias
@@ -138,6 +141,12 @@ namespace
     ULONGLONG g_patchParagraphDeadline = 0;
     bool g_patchParagraphPending = false;
     bool g_patchParagraphDrawn = false;
+    LONG g_patchLayoutVerticalOffset = 0;
+    LONG g_patchLayoutLastOriginalFirstTop = 0;
+    LONG g_patchLayoutLastOriginalLastTop = 0;
+    LONG g_patchLayoutLastRenderedHeight = 0;
+    LONG g_patchLayoutLastLineHeight = 15;
+    bool g_patchLayoutHasLast = false;
 
     struct DebugSnapshot
     {
@@ -152,8 +161,9 @@ namespace
         uint32_t key = 0;
     };
 
-    constexpr int kDebugHistoryCapacity = 200;
-    DebugSnapshot g_debugHistory[kDebugHistoryCapacity] = {};
+    constexpr int kDebugHistoryMaxCapacity = 500;
+    DebugSnapshot g_debugHistory[kDebugHistoryMaxCapacity] = {};
+    int g_debugHistoryCapacity = 200;
     int g_debugHistoryCount = 0;
     int g_debugHistoryNext = 0;
     int g_debugSelectedSlot = -1;
@@ -165,13 +175,16 @@ namespace
     constexpr int kDebugHideTranslatedButton = 1013;
     constexpr int kDebugTranslationEdit = 1005;
     constexpr int kDebugApplyTranslationButton = 1006;
-    constexpr int kDebugCodePageCombo = 1008;
     constexpr int kDebugManualSaveButton = 1009;
     constexpr int kDebugManualSourceEdit = 1010;
     constexpr int kDebugCopyCurrentButton = 1011;
+    constexpr int kDebugTranslateCapturesCheckbox = 1014;
+    constexpr int kDebugHistoryCapacityCombo = 1015;
 
     std::string CopyWideText(LPCWSTR text, int count);
     std::string CopyAnsiHex(LPCSTR text, int count);
+    bool WideToCodePageBytes(UINT codePage, const std::wstring& text,
+        std::string& output);
     void CaptureShipTextA(LPCSTR text, int count, LPRECT rect, UINT format,
         uintptr_t caller, LPCWSTR original, int originalCount,
         LPCWSTR rendered, int renderedCount, uint32_t key);
@@ -182,8 +195,37 @@ namespace
             return -1;
         int slot = g_debugHistoryNext - 1 - index;
         while (slot < 0)
-            slot += kDebugHistoryCapacity;
-        return slot % kDebugHistoryCapacity;
+            slot += g_debugHistoryCapacity;
+        return slot % g_debugHistoryCapacity;
+    }
+
+    void SetDebugHistoryCapacityLocked(int capacity)
+    {
+        if (capacity < 100 || capacity > kDebugHistoryMaxCapacity ||
+            (capacity % 100) != 0 || capacity == g_debugHistoryCapacity)
+            return;
+
+        const int keep = g_debugHistoryCount < capacity
+            ? g_debugHistoryCount : capacity;
+        std::vector<DebugSnapshot> preserved;
+        preserved.reserve(keep);
+        for (int displayIndex = keep - 1; displayIndex >= 0; --displayIndex)
+        {
+            const int slot = HistorySlotAtDisplayIndexLocked(displayIndex);
+            if (slot >= 0)
+                preserved.push_back(g_debugHistory[slot]);
+        }
+
+        g_debugHistoryCapacity = capacity;
+        for (int index = 0; index < static_cast<int>(preserved.size()); ++index)
+            g_debugHistory[index] = preserved[index];
+        g_debugHistoryCount = static_cast<int>(preserved.size());
+        g_debugHistoryNext = g_debugHistoryCount % g_debugHistoryCapacity;
+        g_debugSelectedSlot = g_debugHistoryCount > 0
+            ? g_debugHistoryCount - 1 : -1;
+        g_debugFollowLatest = true;
+        if (g_debugHistoryCount > 0)
+            g_debugSnapshot = g_debugHistory[g_debugHistoryCount - 1];
     }
 
     uint32_t HashWideText(LPCWSTR text, int count)
@@ -315,8 +357,20 @@ namespace
         return valuePos == value.size();
     }
 
+    std::wstring TranslateCapturedValue(const std::wstring& value)
+    {
+        if (value.empty())
+            return value;
+        std::string raw;
+        if (!WideToCodePageBytes(932, value, raw) || raw.empty())
+            return value;
+        const uint32_t key = HashRawText(raw.data(), static_cast<int>(raw.size()));
+        const std::wstring translated = FindTranslation(key);
+        return translated.empty() ? value : translated;
+    }
+
     std::wstring ApplyTranslationTemplate(const std::wstring& translation,
-        const std::vector<std::wstring>& captures)
+        const std::vector<std::wstring>& captures, bool translateCaptures)
     {
         std::wstring result;
         size_t pos = 0;
@@ -336,7 +390,9 @@ namespace
             {
                 return std::wstring();
             }
-            result += captures[index];
+            result += translateCaptures
+                ? TranslateCapturedValue(captures[index])
+                : captures[index];
             pos = close + 1;
         }
         return result;
@@ -355,7 +411,7 @@ namespace
                 continue;
             const size_t literalLength = entry.source.size();
             const std::wstring replacement = ApplyTranslationTemplate(
-                entry.text, captures);
+                entry.text, captures, entry.translateCaptures);
             if (!replacement.empty() && literalLength >= bestLiteralLength)
             {
                 best = replacement;
@@ -365,8 +421,23 @@ namespace
         return best;
     }
 
+    bool HasCaptureTranslationTemplate(const std::wstring& source)
+    {
+        for (const auto& entry : g_translations)
+        {
+            if (!entry.translateCaptures ||
+                entry.source.find(L'{') == std::wstring::npos)
+                continue;
+            std::vector<std::wstring> captures;
+            if (MatchSourceTemplate(entry.source, source, captures))
+                return true;
+        }
+        return false;
+    }
+
     void UpsertTranslation(uint32_t key, const std::wstring& text,
-        const std::wstring& source = std::wstring())
+        const std::wstring& source = std::wstring(),
+        bool translateCaptures = false)
     {
         const std::wstring storedSource = HasTemplatePlaceholder(source)
             ? source : std::wstring();
@@ -377,6 +448,7 @@ namespace
             {
                 entry.text = text;
                 entry.source = storedSource;
+                entry.translateCaptures = !storedSource.empty() && translateCaptures;
                 return;
             }
         }
@@ -384,6 +456,7 @@ namespace
         entry.key = key;
         entry.text = text;
         entry.source = storedSource;
+        entry.translateCaptures = !storedSource.empty() && translateCaptures;
         g_translations.push_back(entry);
     }
 
@@ -490,6 +563,31 @@ namespace
         return result;
     }
 
+    size_t FindJsonObjectEnd(const std::string& data, size_t start)
+    {
+        bool inString = false;
+        bool escaped = false;
+        for (size_t i = start; i < data.size(); ++i)
+        {
+            const char ch = data[i];
+            if (inString)
+            {
+                if (escaped)
+                    escaped = false;
+                else if (ch == '\\')
+                    escaped = true;
+                else if (ch == '"')
+                    inString = false;
+                continue;
+            }
+            if (ch == '"')
+                inString = true;
+            else if (ch == '}')
+                return i;
+        }
+        return std::string::npos;
+    }
+
     void ResolveTranslationPath()
     {
         char modulePath[MAX_PATH] = {};
@@ -551,8 +649,9 @@ namespace
             const std::wstring translation = Utf8ToWide(
                 JsonUnescapeUtf8(data.substr(textStart, textEnd - textStart)));
             std::wstring source;
-            const size_t objectEnd = data.find('}', textEnd + 1);
+            const size_t objectEnd = FindJsonObjectEnd(data, textEnd + 1);
             const size_t sourceKey = data.find("\"source\":\"", textEnd + 1);
+            bool translateCaptures = false;
             if (sourceKey != std::string::npos && objectEnd != std::string::npos &&
                 sourceKey < objectEnd)
             {
@@ -576,7 +675,19 @@ namespace
                         source.clear();
                 }
             }
-            UpsertTranslation(static_cast<uint32_t>(key), translation, source);
+            const std::string captureKey = "\"translate_captures\":";
+            const size_t captureKeyPos = data.find(captureKey, textEnd + 1);
+            if (captureKeyPos != std::string::npos &&
+                objectEnd != std::string::npos && captureKeyPos < objectEnd)
+            {
+                size_t valuePos = captureKeyPos + captureKey.size();
+                while (valuePos < objectEnd &&
+                    (data[valuePos] == ' ' || data[valuePos] == '\t'))
+                    ++valuePos;
+                translateCaptures = data.compare(valuePos, 4, "true") == 0;
+            }
+            UpsertTranslation(static_cast<uint32_t>(key), translation, source,
+                translateCaptures);
             pos = textEnd + 1;
         }
     }
@@ -602,7 +713,10 @@ namespace
                 g_translations[i].source) ? g_translations[i].source : std::wstring();
             const std::string escapedSource = JsonEscapeUtf8(storedSource);
             fwrite(escapedSource.data(), 1, escapedSource.size(), file);
-            fputs(i + 1 == g_translations.size() ? "\"}\n" : "\"},\n", file);
+            fputs("\"", file);
+            if (g_translations[i].translateCaptures && !storedSource.empty())
+                fputs(",\"translate_captures\":true", file);
+            fputs(i + 1 == g_translations.size() ? "}\n" : "},\n", file);
         }
         fputs("  ]\n}\n", file);
         fclose(file);
@@ -611,12 +725,12 @@ namespace
 
     bool IsSupportedReflowWidth(LONG width)
     {
-        return width == 254 || width == 260 || width == 328;
+        return width == 254 || width == 260 || width == 328 || width == 362;
     }
 
     bool IsLegacyReflowWidth(LONG width)
     {
-        return width == 254 || width == 260 || width == 328;
+        return width == 254 || width == 260 || width == 328 || width == 362;
     }
 
     constexpr int kMinHistoricalParagraphSourceBytes = 30;
@@ -826,6 +940,25 @@ namespace
         return caller == 0 || caller == kParagraphDrawCaller;
     }
 
+    LONG MeasurePatchParagraphHeight(HDC dc, LPCWSTR text, int count,
+        LONG width, UINT format)
+    {
+        if (!g_drawTextW || !dc || !text || count <= 0 || width <= 0)
+            return 0;
+
+        RECT measured = { 0, 0, width, 0 };
+        const UINT measureFormat = format | DT_CALCRECT | DT_WORDBREAK;
+        g_drawTextW(dc, text, count, &measured, measureFormat);
+        LONG height = measured.bottom - measured.top;
+        if (height <= 0)
+        {
+            TEXTMETRICW metrics = {};
+            if (GetTextMetricsW(dc, &metrics) && metrics.tmHeight > 0)
+                height = metrics.tmHeight;
+        }
+        return height;
+    }
+
     bool FindPatchParagraphLine(LPCSTR line, int count, size_t& after)
     {
         if (!line || count < 4 || g_patchParagraphSourceBytes.empty())
@@ -862,24 +995,75 @@ namespace
         size_t after = 0;
         if (!FindPatchParagraphLine(line, count, after))
             return false;
-        if (rect->top == 0)
+        // A dialog can contain several cached paragraphs.  Later paragraphs
+        // legitimately start at non-zero top coordinates (for example 90,
+        // 180, 270), so the matching first line—not top == 0—must start the
+        // historical replay.
+        if (g_patchParagraphPending)
         {
-            if (g_patchParagraphPending)
+            if (g_patchLayoutHasLast && rect->top <= g_patchLayoutLastOriginalFirstTop)
             {
-                RECT expanded = *rect;
-                g_patchParagraphNextByte = after;
-                expanded.bottom = expanded.top + 512;
-                g_patchParagraphPending = false;
-                g_patchParagraphDrawn = true;
-                result = g_drawTextW(dc, g_patchParagraph,
-                    g_patchParagraphCount, &expanded, format);
-                return true;
+                // A new repaint/scroll pass starts from an earlier source
+                // line.  Do not carry the previous pass's vertical offset.
+                g_patchLayoutVerticalOffset = 0;
+                g_patchLayoutHasLast = false;
             }
+
+            if (g_patchLayoutHasLast)
+            {
+                const LONG lineHeight = g_patchLayoutLastLineHeight > 0
+                    ? g_patchLayoutLastLineHeight : 15;
+                LONG originalTrailingGap = rect->top -
+                    g_patchLayoutLastOriginalLastTop - lineHeight;
+                if (originalTrailingGap < 0)
+                    originalTrailingGap = 0;
+                const LONG originalParagraphSpan = rect->top -
+                    g_patchLayoutLastOriginalFirstTop;
+                const LONG desiredParagraphSpan =
+                    g_patchLayoutLastRenderedHeight + originalTrailingGap;
+                g_patchLayoutVerticalOffset += desiredParagraphSpan -
+                    originalParagraphSpan;
+                if (g_patchTrace)
+                    log("[PATCHTRACE] layout previousHeight=%ld originalSpan=%ld "
+                        "trailingGap=%ld delta=%ld offset=%ld\n",
+                        g_patchLayoutLastRenderedHeight, originalParagraphSpan,
+                        originalTrailingGap,
+                        desiredParagraphSpan - originalParagraphSpan,
+                        g_patchLayoutVerticalOffset);
+            }
+
+            RECT expanded = *rect;
+            g_patchParagraphNextByte = after;
+            const LONG renderedHeight = MeasurePatchParagraphHeight(dc,
+                g_patchParagraph, g_patchParagraphCount,
+                rect->right - rect->left, format);
+            expanded.top = rect->top + g_patchLayoutVerticalOffset;
+            expanded.bottom = expanded.top + 512;
             g_patchParagraphPending = false;
-            g_patchParagraphDrawn = false;
+            g_patchParagraphDrawn = true;
+            g_patchLayoutLastOriginalFirstTop = rect->top;
+            g_patchLayoutLastOriginalLastTop = rect->top;
+            g_patchLayoutLastRenderedHeight = renderedHeight > 0
+                ? renderedHeight : g_patchLayoutLastLineHeight;
+            g_patchLayoutHasLast = true;
+            if (g_patchTrace)
+                log("[PATCHTRACE] replay top=%ld drawTop=%ld width=%ld "
+                    "height=%ld count=%d\n", rect->top, expanded.top,
+                    rect->right - rect->left, g_patchLayoutLastRenderedHeight,
+                    g_patchParagraphCount);
+            result = g_drawTextW(dc, g_patchParagraph,
+                g_patchParagraphCount, &expanded, format);
+            return true;
         }
         if (g_patchParagraphDrawn)
         {
+            if (rect->top > g_patchLayoutLastOriginalLastTop)
+            {
+                const LONG step = rect->top - g_patchLayoutLastOriginalLastTop;
+                if (step > 0 && step < 128)
+                    g_patchLayoutLastLineHeight = step;
+            }
+            g_patchLayoutLastOriginalLastTop = rect->top;
             g_patchParagraphNextByte = after;
             result = 0;
             return true;
@@ -895,8 +1079,10 @@ namespace
         std::vector<DebugSnapshot> history;
         int firstVisibleSlot = -1;
         int selectedDisplayIndex = -1;
+        int historyCapacity = 200;
         EnterCriticalSection(&g_debugLock);
         snapshot = g_debugSnapshot;
+        historyCapacity = g_debugHistoryCapacity;
         for (int i = 0; i < g_debugHistoryCount; ++i)
         {
             const int slot = HistorySlotAtDisplayIndexLocked(i);
@@ -926,6 +1112,8 @@ namespace
         HWND historyList = GetDlgItem(hwnd, kDebugHistoryList);
         HWND text = GetDlgItem(hwnd, 1003);
         HWND translation = GetDlgItem(hwnd, kDebugTranslationEdit);
+        HWND captureToggle = GetDlgItem(hwnd, kDebugTranslateCapturesCheckbox);
+        HWND capacityCombo = GetDlgItem(hwnd, kDebugHistoryCapacityCombo);
         HWND info = GetDlgItem(hwnd, 1004);
         if (historyList)
         {
@@ -953,14 +1141,24 @@ namespace
                 value = FindTemplateTranslation(snapshot.text);
             SetWindowTextW(translation, value.c_str());
         }
+        if (captureToggle)
+        {
+            SendMessageW(captureToggle, BM_SETCHECK,
+                HasCaptureTranslationTemplate(snapshot.text)
+                    ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
+        if (capacityCombo)
+        {
+            const int selection = historyCapacity / 100 - 1;
+            SendMessageW(capacityCombo, CB_SETCURSEL, selection, 0);
+        }
         if (info)
         {
             wchar_t line[512] = {};
             swprintf_s(line, ARRAYSIZE(line),
                 L"count=%d  format=0x%08X  rect=%ld,%ld - %ld,%ld  state=%d  cp=%ld",
                 snapshot.count, snapshot.format, snapshot.left, snapshot.top,
-                snapshot.right, snapshot.bottom, snapshot.state,
-                InterlockedCompareExchange(&g_debugSourceCodePage, 0, 0));
+                snapshot.right, snapshot.bottom, snapshot.state, 932L);
             SetWindowTextW(info, line);
         }
     }
@@ -971,7 +1169,7 @@ namespace
         {
         case WM_CREATE:
         {
-            CreateWindowW(L"STATIC", L"\u6700\u8FD1\u6587\u5B57\u8BB0\u5F55\uFF08\u6700\u591A200\u6761\uFF09", WS_CHILD | WS_VISIBLE,
+            CreateWindowW(L"STATIC", L"\u6700\u8FD1\u6587\u5B57\u8BB0\u5F55", WS_CHILD | WS_VISIBLE,
                 10, 10, 260, 20, hwnd, nullptr, nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u9690\u85CF\u5DF2\u7FFB\u8BD1", WS_CHILD | WS_VISIBLE |
                 BS_AUTOCHECKBOX,
@@ -1000,29 +1198,39 @@ namespace
                 ES_MULTILINE | WS_VSCROLL,
                 85, 345, 485, 60, hwnd,
                 reinterpret_cast<HMENU>(kDebugTranslationEdit), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"\u901A\u914D\u7B26\u4E8C\u6B21\u6BD4\u5BF9", WS_CHILD | WS_VISIBLE |
+                BS_AUTOCHECKBOX,
+                85, 410, 160, 24, hwnd,
+                reinterpret_cast<HMENU>(kDebugTranslateCapturesCheckbox), nullptr, nullptr);
+            CreateWindowW(L"STATIC", L"\u7F13\u5B58\u6761\u6570:", WS_CHILD | WS_VISIBLE,
+                255, 414, 65, 20, hwnd, nullptr, nullptr, nullptr);
+            HWND capacityCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE |
+                WS_BORDER | CBS_DROPDOWNLIST,
+                325, 410, 80, 140, hwnd,
+                reinterpret_cast<HMENU>(kDebugHistoryCapacityCombo), nullptr, nullptr);
+            if (capacityCombo)
+            {
+                SendMessageW(capacityCombo, CB_ADDSTRING, 0,
+                    reinterpret_cast<LPARAM>(L"100"));
+                SendMessageW(capacityCombo, CB_ADDSTRING, 0,
+                    reinterpret_cast<LPARAM>(L"200"));
+                SendMessageW(capacityCombo, CB_ADDSTRING, 0,
+                    reinterpret_cast<LPARAM>(L"300"));
+                SendMessageW(capacityCombo, CB_ADDSTRING, 0,
+                    reinterpret_cast<LPARAM>(L"400"));
+                SendMessageW(capacityCombo, CB_ADDSTRING, 0,
+                    reinterpret_cast<LPARAM>(L"500"));
+                SendMessageW(capacityCombo, CB_SETCURSEL, 1, 0);
+            }
             CreateWindowW(L"BUTTON", L"\u4FDD\u5B58\u7FFB\u8BD1", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                85, 415, 120, 24, hwnd,
+                85, 440, 120, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugApplyTranslationButton), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u590D\u5236\u5F53\u524D\u539F\u6587", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                210, 415, 120, 24, hwnd,
+                210, 440, 120, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugCopyCurrentButton), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u4FDD\u5B58\u624B\u52A8\u8BB0\u5F55", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                335, 415, 125, 24, hwnd,
+                335, 440, 125, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugManualSaveButton), nullptr, nullptr);
-            CreateWindowW(L"STATIC", L"\u539F\u6587\u89E3\u7801:", WS_CHILD | WS_VISIBLE,
-                10, 450, 70, 22, hwnd, nullptr, nullptr, nullptr);
-            HWND codePage = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE |
-                WS_BORDER | CBS_DROPDOWNLIST,
-                85, 446, 180, 160, hwnd,
-                reinterpret_cast<HMENU>(kDebugCodePageCombo), nullptr, nullptr);
-            if (codePage)
-            {
-                SendMessageW(codePage, CB_ADDSTRING, 0,
-                    reinterpret_cast<LPARAM>(L"CP932 (Japanese)"));
-                SendMessageW(codePage, CB_ADDSTRING, 0,
-                    reinterpret_cast<LPARAM>(L"CP936 (Chinese/GBK)"));
-                SendMessageW(codePage, CB_SETCURSEL, 0, 0);
-            }
             return 0;
         }
         case WM_COMMAND:
@@ -1056,13 +1264,20 @@ namespace
                 UpdateDebugControls(hwnd);
                 return 0;
             }
-            if (LOWORD(wParam) == kDebugCodePageCombo &&
+            if (LOWORD(wParam) == kDebugHistoryCapacityCombo &&
                 HIWORD(wParam) == CBN_SELCHANGE)
             {
-                HWND codePage = GetDlgItem(hwnd, kDebugCodePageCombo);
-                LRESULT selected = SendMessageW(codePage, CB_GETCURSEL, 0, 0);
-                InterlockedExchange(&g_debugSourceCodePage,
-                    selected == 1 ? 936 : 932);
+                HWND capacityCombo = GetDlgItem(hwnd, kDebugHistoryCapacityCombo);
+                const LRESULT selected = SendMessageW(capacityCombo,
+                    CB_GETCURSEL, 0, 0);
+                if (selected >= 0 && selected <= 4 && g_debugLockInitialized)
+                {
+                    EnterCriticalSection(&g_debugLock);
+                    SetDebugHistoryCapacityLocked(
+                        100 + static_cast<int>(selected) * 100);
+                    LeaveCriticalSection(&g_debugLock);
+                    UpdateDebugControls(hwnd);
+                }
                 return 0;
             }
             if (LOWORD(wParam) == kDebugCopyCurrentButton)
@@ -1083,8 +1298,11 @@ namespace
                 wchar_t translation[4096] = {};
                 GetDlgItemTextW(hwnd, kDebugManualSourceEdit, source, ARRAYSIZE(source));
                 GetDlgItemTextW(hwnd, kDebugTranslationEdit, translation, ARRAYSIZE(translation));
-                UINT codePage = static_cast<UINT>(InterlockedCompareExchange(
-                    &g_debugSourceCodePage, 0, 0));
+                const UINT codePage = 932;
+                HWND captureToggle = GetDlgItem(hwnd,
+                    kDebugTranslateCapturesCheckbox);
+                const bool translateCaptures = captureToggle &&
+                    SendMessageW(captureToggle, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 std::string raw;
                 if (source[0])
                 {
@@ -1106,7 +1324,8 @@ namespace
                         EnterCriticalSection(&g_debugLock);
                         if (key != 0)
                         {
-                            UpsertTranslation(key, translation, sourceText);
+                            UpsertTranslation(key, translation, sourceText,
+                                translateCaptures);
                             SaveTranslations();
                         }
                         LeaveCriticalSection(&g_debugLock);
@@ -1228,8 +1447,8 @@ namespace
         {
             const int slot = g_debugHistoryNext;
             g_debugHistory[slot] = incoming;
-            g_debugHistoryNext = (g_debugHistoryNext + 1) % kDebugHistoryCapacity;
-            if (g_debugHistoryCount < kDebugHistoryCapacity)
+            g_debugHistoryNext = (g_debugHistoryNext + 1) % g_debugHistoryCapacity;
+            if (g_debugHistoryCount < g_debugHistoryCapacity)
                 ++g_debugHistoryCount;
             historyChanged = true;
 
@@ -1318,6 +1537,35 @@ namespace
         wchar_t* match = wcsstr(text, duplicate);
         if (match)
             *match = L'\0';
+
+        // The rate.dat evaluation records use a long run of full-width
+        // spaces after each evaluation heading to force the following body
+        // text onto a separate Japanese line.  Reflowing the whole paragraph
+        // with the translated font can otherwise fit that body on the same
+        // line.  Convert only this confirmed heading format to an explicit
+        // line break; ordinary full-width spaces remain unchanged.
+        const wchar_t* headingPrefix = L"\u226A\u8A2D\u8A08\u8A55\u4FA1\u8005\uFF1A";
+        const wchar_t headingEnd = L'\u226B';
+        const wchar_t fullWidthSpace = L'\u3000';
+        const size_t prefixLength = wcslen(headingPrefix);
+        wchar_t* search = text;
+        while ((search = wcsstr(search, headingPrefix)) != nullptr)
+        {
+            wchar_t* marker = wcschr(search + prefixLength, headingEnd);
+            if (!marker)
+                break;
+            wchar_t* firstSpace = marker + 1;
+            wchar_t* afterSpaces = firstSpace;
+            while (*afterSpaces == fullWidthSpace)
+                ++afterSpaces;
+            if (afterSpaces - firstSpace >= 4)
+            {
+                *firstSpace = L'\n';
+                wmemmove(firstSpace + 1, afterSpaces,
+                    wcslen(afterSpaces) + 1);
+            }
+            search = marker + 1;
+        }
     }
 
     void CachePatchParagraph(LPCSTR sourceBytes, int sourceCount,
@@ -1419,6 +1667,10 @@ namespace
             converted[copy] = L'\0';
             convertedCount = copy;
         }
+        // Apply the confirmed rate.dat heading layout to translated text as
+        // well as the original Japanese text.
+        NormalizeKnownPatchText(converted, ARRAYSIZE(converted));
+        convertedCount = lstrlenW(converted);
 
         CaptureShipTextA(text, actualCount, rect, format, callerAddress,
             originalText, originalCount, converted, convertedCount, originalKey);

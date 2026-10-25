@@ -1002,6 +1002,7 @@ DWORD WINAPI Load(LPVOID lpParam)
 {
 	config.LoadConfig("version.json");
 
+#ifndef WSC3_RELEASE_NO_LOGGING
 	if (config.GetBool("logging"))
 	{
 		// The below is just to force the console window visible in x64dbg
@@ -1020,6 +1021,7 @@ DWORD WINAPI Load(LPVOID lpParam)
 		logCreateFile = config.GetBool("logCreateFile");
 		logSCSIPassThrough = config.GetBool("logSCSIPassThrough");
 	}
+#endif
 
 	load_version();
 	if (!version_dll)

@@ -8,6 +8,7 @@ FILE* log_file = NULL;
 bool loggingEnabled = false;
 CRITICAL_SECTION log_critical_section;
 
+#ifndef WSC3_RELEASE_NO_LOGGING
 void SetLogging(bool enable, const char* logFileName)
 {
 	InitializeCriticalSection(&log_critical_section);
@@ -166,6 +167,7 @@ void LogKey(const char* keyName, DWORD addr, int keyLength)
 		log("\n");
 	}
 }
+#endif
 
 BYTE hexdigit(char hex)
 {

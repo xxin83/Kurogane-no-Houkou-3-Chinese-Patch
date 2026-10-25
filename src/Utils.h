@@ -6,10 +6,19 @@
 
 extern FILE* log_file;
 
+// Release builds can remove logging work completely while keeping the legacy
+// implementations available to debug builds.
+#ifdef WSC3_RELEASE_NO_LOGGING
+inline void SetLogging(bool, const char* = NULL) {}
+inline void logc(WORD, const char*, ...) {}
+inline void log(const char*, ...) {}
+inline void LogKey(const char*, DWORD, int = 16) {}
+#else
 void SetLogging(bool enable, const char* logFileName = NULL);
 void logc(WORD col, const char* fmt, ...);
 void log(const char* fmt, ...);
 void LogKey(const char *keyName, DWORD addr, int keyLength = 16);
+#endif
 BYTE hexdigit(char hex);
 BYTE hexbyte(const char* hex);
 DWORD FindHex(DWORD StartAddr, DWORD EndAddr, BYTE *searchHex, DWORD searchSize);
