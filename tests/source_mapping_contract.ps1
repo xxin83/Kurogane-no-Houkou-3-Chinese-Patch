@@ -23,3 +23,14 @@ foreach ($token in @(
 }
 
 Write-Output 'source_mapping_contract: PASS'
+
+$mergeStart = $ui.IndexOf('void MergeSourceSnapshotLocked')
+$mergeEnd = $ui.IndexOf('std::vector<SourceCandidate>', $mergeStart)
+if ($mergeStart -lt 0 -or $mergeEnd -lt 0) {
+    throw 'Unable to locate source snapshot merge implementation.'
+}
+$mergeBody = $ui.Substring($mergeStart, $mergeEnd - $mergeStart)
+if ($mergeBody -match 'g_sourceCacheBytes\s*-=' -and
+    $mergeBody -match 'RemoveSourceSnapshotLocked\(i\)') {
+    throw 'Merged source snapshots must not subtract cache bytes twice.'
+}

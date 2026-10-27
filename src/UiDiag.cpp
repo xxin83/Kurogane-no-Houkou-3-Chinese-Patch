@@ -357,7 +357,6 @@ namespace
                     existing.bytes.data(), existing.bytes.size());
                 memcpy(&merged[static_cast<size_t>(incoming.offset - start)],
                     incoming.bytes.data(), incoming.bytes.size());
-                g_sourceCacheBytes -= existing.bytes.size();
                 incoming.offset = start;
                 incoming.bytes.swap(merged);
                 RemoveSourceSnapshotLocked(i);
