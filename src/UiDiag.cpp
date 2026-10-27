@@ -174,6 +174,20 @@ namespace
         bool cursorKnown = true;
     };
 
+    struct SourceMappingContext
+    {
+        std::wstring path;
+        ULONGLONG fileSize = 0;
+    };
+
+    struct SourceMappedViewContext
+    {
+        HANDLE mapping = nullptr;
+        std::wstring path;
+        ULONGLONG offset = 0;
+        SIZE_T length = 0;
+    };
+
     struct SourceReadSnapshot
     {
         std::wstring path;
@@ -200,6 +214,8 @@ namespace
     };
 
     std::map<HANDLE, SourceHandleContext> g_sourceHandles;
+    std::map<HANDLE, SourceMappingContext> g_sourceMappings;
+    std::map<LPCVOID, SourceMappedViewContext> g_sourceViews;
     std::vector<SourceReadSnapshot> g_sourceSnapshots;
     SRWLOCK g_sourceLock = SRWLOCK_INIT;
     ULONGLONG g_sourceTouch = 0;
@@ -2807,6 +2823,102 @@ void TrackSourceFileClose(HANDLE handle)
         return;
     AcquireSRWLockExclusive(&g_sourceLock);
     g_sourceHandles.erase(handle);
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+void TrackSourceMappingClose(HANDLE handle)
+{
+    if (!handle || handle == INVALID_HANDLE_VALUE)
+        return;
+    AcquireSRWLockExclusive(&g_sourceLock);
+    g_sourceMappings.erase(handle);
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+// mapping source snapshots are copied from the mapped view, never from a
+// second disk read, so the original game resource remains untouched.
+void TrackSourceFileMapping(HANDLE mapping, HANDLE file, ULONGLONG mappingSize)
+{
+    if (!mapping || mapping == INVALID_HANDLE_VALUE || !file ||
+        file == INVALID_HANDLE_VALUE)
+        return;
+
+    SourceMappingContext context;
+    AcquireSRWLockShared(&g_sourceLock);
+    auto found = g_sourceHandles.find(file);
+    if (found != g_sourceHandles.end())
+        context.path = found->second.path;
+    ReleaseSRWLockShared(&g_sourceLock);
+    if (context.path.empty())
+        return;
+
+    if (mappingSize == 0)
+    {
+        LARGE_INTEGER fileSize = {};
+        if (GetFileSizeEx(file, &fileSize) && fileSize.QuadPart > 0)
+            mappingSize = static_cast<ULONGLONG>(fileSize.QuadPart);
+    }
+    context.fileSize = mappingSize;
+    AcquireSRWLockExclusive(&g_sourceLock);
+    g_sourceMappings[mapping] = std::move(context);
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+bool CopyMappedViewBytes(LPCVOID view, char* destination, size_t length)
+{
+    if (!view || !destination || length == 0)
+        return false;
+    __try
+    {
+        memcpy(destination, view, length);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return true;
+}
+
+void TrackSourceMappedView(LPVOID view, HANDLE mapping, ULONGLONG offset,
+    SIZE_T bytesToMap)
+{
+    if (!view || !mapping)
+        return;
+    SourceMappedViewContext viewContext;
+    AcquireSRWLockExclusive(&g_sourceLock);
+    auto found = g_sourceMappings.find(mapping);
+    if (found == g_sourceMappings.end())
+    {
+        ReleaseSRWLockExclusive(&g_sourceLock);
+        return;
+    }
+    viewContext.mapping = mapping;
+    viewContext.path = found->second.path;
+    viewContext.offset = offset;
+    SIZE_T available = bytesToMap;
+    if (available == 0 && found->second.fileSize > offset)
+        available = static_cast<SIZE_T>(found->second.fileSize - offset);
+    viewContext.length = available;
+    g_sourceViews[view] = viewContext;
+
+    const size_t copyLength = available < kSourcePerFileLimit
+        ? static_cast<size_t>(available) : kSourcePerFileLimit;
+    if (copyLength > 0)
+    {
+        std::string copied(copyLength, '\0');
+        if (CopyMappedViewBytes(view, &copied[0], copyLength))
+            MergeSourceSnapshotLocked(viewContext.path, offset, true,
+                copied.data(), copied.size());
+    }
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+void TrackSourceUnmappedView(LPCVOID view)
+{
+    if (!view)
+        return;
+    AcquireSRWLockExclusive(&g_sourceLock);
+    g_sourceViews.erase(view);
     ReleaseSRWLockExclusive(&g_sourceLock);
 }
 

@@ -15,6 +15,11 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
 void TrackSourceFileHandle(HANDLE handle, LPCWSTR path);
 void TrackSourceFileHandleA(HANDLE handle, LPCSTR path);
 void TrackSourceFileClose(HANDLE handle);
+void TrackSourceMappingClose(HANDLE handle);
 void TrackSourceRead(HANDLE handle, LPCVOID buffer, DWORD bytesRead,
     const OVERLAPPED* overlapped);
 void TrackSourceFilePointer(HANDLE handle, ULONGLONG newPosition, bool known);
+void TrackSourceFileMapping(HANDLE mapping, HANDLE file, ULONGLONG mappingSize);
+void TrackSourceMappedView(LPVOID view, HANDLE mapping, ULONGLONG offset,
+    SIZE_T bytesToMap);
+void TrackSourceUnmappedView(LPCVOID view);

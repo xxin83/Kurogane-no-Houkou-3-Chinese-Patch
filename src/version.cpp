@@ -99,6 +99,24 @@ SetFilePointerEx_typedef SetFilePointerEx_Orig;
 typedef BOOL(WINAPI* CloseHandle_typedef)(HANDLE hObject);
 CloseHandle_typedef CloseHandle_Orig;
 
+typedef HANDLE(WINAPI* CreateFileMappingA_typedef)(HANDLE hFile,
+    LPSECURITY_ATTRIBUTES lpAttributes, DWORD flProtect, DWORD dwMaximumSizeHigh,
+    DWORD dwMaximumSizeLow, LPCSTR lpName);
+CreateFileMappingA_typedef CreateFileMappingA_Orig;
+
+typedef HANDLE(WINAPI* CreateFileMappingW_typedef)(HANDLE hFile,
+    LPSECURITY_ATTRIBUTES lpAttributes, DWORD flProtect, DWORD dwMaximumSizeHigh,
+    DWORD dwMaximumSizeLow, LPCWSTR lpName);
+CreateFileMappingW_typedef CreateFileMappingW_Orig;
+
+typedef LPVOID(WINAPI* MapViewOfFile_typedef)(HANDLE hFileMappingObject,
+    DWORD dwDesiredAccess, DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
+    SIZE_T dwNumberOfBytesToMap);
+MapViewOfFile_typedef MapViewOfFile_Orig;
+
+typedef BOOL(WINAPI* UnmapViewOfFile_typedef)(LPCVOID lpBaseAddress);
+UnmapViewOfFile_typedef UnmapViewOfFile_Orig;
+
 typedef BOOL(WINAPI* FreeLibrary_typedef)(HMODULE hLibModule);
 FreeLibrary_typedef FreeLibrary_Orig;
 
@@ -491,7 +509,60 @@ BOOL WINAPI CloseHandle_Hook(HANDLE hObject)
 {
 	BOOL result = CloseHandle_Orig(hObject);
 	if (result)
+	{
+		TrackSourceMappingClose(hObject);
 		TrackSourceFileClose(hObject);
+	}
+	return result;
+}
+
+HANDLE WINAPI CreateFileMappingA_Hook(HANDLE hFile, LPSECURITY_ATTRIBUTES attributes,
+	DWORD protect, DWORD maximumSizeHigh, DWORD maximumSizeLow, LPCSTR name)
+{
+	HANDLE mapping = CreateFileMappingA_Orig(hFile, attributes, protect,
+		maximumSizeHigh, maximumSizeLow, name);
+	if (mapping)
+	{
+		const ULONGLONG mappingSize = (static_cast<ULONGLONG>(maximumSizeHigh) << 32) |
+			maximumSizeLow;
+		TrackSourceFileMapping(mapping, hFile, mappingSize);
+	}
+	return mapping;
+}
+
+HANDLE WINAPI CreateFileMappingW_Hook(HANDLE hFile, LPSECURITY_ATTRIBUTES attributes,
+	DWORD protect, DWORD maximumSizeHigh, DWORD maximumSizeLow, LPCWSTR name)
+{
+	HANDLE mapping = CreateFileMappingW_Orig(hFile, attributes, protect,
+		maximumSizeHigh, maximumSizeLow, name);
+	if (mapping)
+	{
+		const ULONGLONG mappingSize = (static_cast<ULONGLONG>(maximumSizeHigh) << 32) |
+			maximumSizeLow;
+		TrackSourceFileMapping(mapping, hFile, mappingSize);
+	}
+	return mapping;
+}
+
+LPVOID WINAPI MapViewOfFile_Hook(HANDLE mapping, DWORD desiredAccess,
+	DWORD offsetHigh, DWORD offsetLow, SIZE_T bytesToMap)
+{
+	LPVOID view = MapViewOfFile_Orig(mapping, desiredAccess, offsetHigh,
+		offsetLow, bytesToMap);
+	if (view)
+	{
+		const ULONGLONG offset = (static_cast<ULONGLONG>(offsetHigh) << 32) |
+			offsetLow;
+		TrackSourceMappedView(view, mapping, offset, bytesToMap);
+	}
+	return view;
+}
+
+BOOL WINAPI UnmapViewOfFile_Hook(LPCVOID baseAddress)
+{
+	BOOL result = UnmapViewOfFile_Orig(baseAddress);
+	if (result)
+		TrackSourceUnmappedView(baseAddress);
 	return result;
 }
 
@@ -1215,6 +1286,18 @@ DWORD WINAPI Load(LPVOID lpParam)
 		if (MH_CreateHookApi(L"kernel32", "CloseHandle", &CloseHandle_Hook,
 			reinterpret_cast<LPVOID*>(&CloseHandle_Orig)) != MH_OK)
 			log("Unable to hook CloseHandle for source provenance\n");
+		if (MH_CreateHookApi(L"kernel32", "CreateFileMappingA", &CreateFileMappingA_Hook,
+			reinterpret_cast<LPVOID*>(&CreateFileMappingA_Orig)) != MH_OK)
+			log("Unable to hook CreateFileMappingA for source provenance\n");
+		if (MH_CreateHookApi(L"kernel32", "CreateFileMappingW", &CreateFileMappingW_Hook,
+			reinterpret_cast<LPVOID*>(&CreateFileMappingW_Orig)) != MH_OK)
+			log("Unable to hook CreateFileMappingW for source provenance\n");
+		if (MH_CreateHookApi(L"kernel32", "MapViewOfFile", &MapViewOfFile_Hook,
+			reinterpret_cast<LPVOID*>(&MapViewOfFile_Orig)) != MH_OK)
+			log("Unable to hook MapViewOfFile for source provenance\n");
+		if (MH_CreateHookApi(L"kernel32", "UnmapViewOfFile", &UnmapViewOfFile_Hook,
+			reinterpret_cast<LPVOID*>(&UnmapViewOfFile_Orig)) != MH_OK)
+			log("Unable to hook UnmapViewOfFile for source provenance\n");
 	}
 
 	auto LoadLibrayHook = &LoadLibraryA_Hook;	// For Safedisc 2.9 and above
