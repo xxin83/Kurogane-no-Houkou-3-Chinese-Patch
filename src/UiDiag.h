@@ -9,3 +9,12 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
     bool debugWindow = false, UINT patchTextCodePage = 936,
     bool originalNullGuard = false, bool captureShipData = false,
     bool forceSystemCp932 = false);
+
+// Runtime resource provenance hooks.  These functions only record bounded
+// read snapshots; they do not alter the file APIs or game data.
+void TrackSourceFileHandle(HANDLE handle, LPCWSTR path);
+void TrackSourceFileHandleA(HANDLE handle, LPCSTR path);
+void TrackSourceFileClose(HANDLE handle);
+void TrackSourceRead(HANDLE handle, LPCVOID buffer, DWORD bytesRead,
+    const OVERLAPPED* overlapped);
+void TrackSourceFilePointer(HANDLE handle, ULONGLONG newPosition, bool known);

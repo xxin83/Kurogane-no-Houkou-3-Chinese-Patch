@@ -84,6 +84,21 @@ CreateFileA_typedef CreateFileA_Orig_KBase;
 typedef HANDLE(WINAPI* CreateFileW_typedef)(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile);
 CreateFileW_typedef CreateFileW_Orig;
 
+typedef BOOL(WINAPI* ReadFile_typedef)(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
+    LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped);
+ReadFile_typedef ReadFile_Orig;
+
+typedef DWORD(WINAPI* SetFilePointer_typedef)(HANDLE hFile, LONG lDistanceToMove,
+    PLONG lpDistanceToMoveHigh, DWORD dwMoveMethod);
+SetFilePointer_typedef SetFilePointer_Orig;
+
+typedef BOOL(WINAPI* SetFilePointerEx_typedef)(HANDLE hFile, LARGE_INTEGER liDistanceToMove,
+    PLARGE_INTEGER lpNewFilePointer, DWORD dwMoveMethod);
+SetFilePointerEx_typedef SetFilePointerEx_Orig;
+
+typedef BOOL(WINAPI* CloseHandle_typedef)(HANDLE hObject);
+CloseHandle_typedef CloseHandle_Orig;
+
 typedef BOOL(WINAPI* FreeLibrary_typedef)(HMODULE hLibModule);
 FreeLibrary_typedef FreeLibrary_Orig;
 
@@ -396,6 +411,7 @@ HANDLE WINAPI CreateFileA_Hook(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD d
 
 	if (logCreateFile)
 		log("CreateFileA_Hook Hook - lpFileName: %s ret: %08X\n", lpFileName == NULL ? "!NULL!" : lpFileName, ret);
+	TrackSourceFileHandleA(ret, lpFileName);
 
 	return ret;
 }
@@ -414,6 +430,7 @@ HANDLE WINAPI CreateFileA_Hook_KBase(LPCSTR lpFileName, DWORD dwDesiredAccess, D
 
 	if (logCreateFile)
 		log("CreateFileA_Hook_KBase Hook - lpFileName: %s ret: %08X\n", lpFileName == NULL ? "!NULL!" : lpFileName, ret);
+	TrackSourceFileHandleA(ret, lpFileName);
 
 	return ret;
 }
@@ -427,7 +444,55 @@ HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD 
 	if (logCreateFile)
 		logc(FOREGROUND_BLUE, "CreateFileW_Hook - Testing %s\n", (LPCSTR)strFileName);
 	
-	return CreateFileW_Orig(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);;
+	HANDLE ret = CreateFileW_Orig(lpFileName, dwDesiredAccess, dwShareMode,
+		lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+	TrackSourceFileHandle(ret, lpFileName);
+	return ret;
+}
+
+BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
+	LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped)
+{
+	BOOL result = ReadFile_Orig(hFile, lpBuffer, nNumberOfBytesToRead,
+		lpNumberOfBytesRead, lpOverlapped);
+	if (result && lpNumberOfBytesRead && *lpNumberOfBytesRead > 0)
+		TrackSourceRead(hFile, lpBuffer, *lpNumberOfBytesRead, lpOverlapped);
+	return result;
+}
+
+DWORD WINAPI SetFilePointer_Hook(HANDLE hFile, LONG distanceToMove,
+	PLONG distanceToMoveHigh, DWORD moveMethod)
+{
+	SetLastError(ERROR_SUCCESS);
+	DWORD result = SetFilePointer_Orig(hFile, distanceToMove,
+		distanceToMoveHigh, moveMethod);
+	const DWORD error = GetLastError();
+	if (result != INVALID_SET_FILE_POINTER || error == ERROR_SUCCESS)
+	{
+		ULONGLONG position = result;
+		if (distanceToMoveHigh)
+			position |= static_cast<ULONGLONG>(static_cast<DWORD>(*distanceToMoveHigh)) << 32;
+		TrackSourceFilePointer(hFile, position, true);
+	}
+	return result;
+}
+
+BOOL WINAPI SetFilePointerEx_Hook(HANDLE hFile, LARGE_INTEGER distanceToMove,
+	PLARGE_INTEGER newFilePointer, DWORD moveMethod)
+{
+	BOOL result = SetFilePointerEx_Orig(hFile, distanceToMove,
+		newFilePointer, moveMethod);
+	if (result && newFilePointer)
+		TrackSourceFilePointer(hFile, static_cast<ULONGLONG>(newFilePointer->QuadPart), true);
+	return result;
+}
+
+BOOL WINAPI CloseHandle_Hook(HANDLE hObject)
+{
+	BOOL result = CloseHandle_Orig(hObject);
+	if (result)
+		TrackSourceFileClose(hObject);
+	return result;
 }
 
 BOOL WINAPI CreateProcessA_Hook(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
@@ -1131,6 +1196,25 @@ DWORD WINAPI Load(LPVOID lpParam)
 	{
 		log("Unable to hook CreateFileW\n");
 		return 0;
+	}
+
+	// The source index is only needed while the diagnostics UI is active.
+	// Keeping these hooks opt-in avoids adding ReadFile bookkeeping to normal
+	// release play while preserving the existing CreateFile compatibility hooks.
+	if (config.GetBool("uiDiagnostics") && config.GetBool("uiDebugWindow", false))
+	{
+		if (MH_CreateHookApi(L"kernel32", "ReadFile", &ReadFile_Hook,
+			reinterpret_cast<LPVOID*>(&ReadFile_Orig)) != MH_OK)
+			log("Unable to hook ReadFile for source provenance\n");
+		if (MH_CreateHookApi(L"kernel32", "SetFilePointer", &SetFilePointer_Hook,
+			reinterpret_cast<LPVOID*>(&SetFilePointer_Orig)) != MH_OK)
+			log("Unable to hook SetFilePointer for source provenance\n");
+		if (MH_CreateHookApi(L"kernel32", "SetFilePointerEx", &SetFilePointerEx_Hook,
+			reinterpret_cast<LPVOID*>(&SetFilePointerEx_Orig)) != MH_OK)
+			log("Unable to hook SetFilePointerEx for source provenance\n");
+		if (MH_CreateHookApi(L"kernel32", "CloseHandle", &CloseHandle_Hook,
+			reinterpret_cast<LPVOID*>(&CloseHandle_Orig)) != MH_OK)
+			log("Unable to hook CloseHandle for source provenance\n");
 	}
 
 	auto LoadLibrayHook = &LoadLibraryA_Hook;	// For Safedisc 2.9 and above

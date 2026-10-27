@@ -2,6 +2,8 @@
 #include <Windows.h>
 #include <intrin.h>
 #include <algorithm>
+#include <cwctype>
+#include <map>
 #include <string>
 #include <vector>
 #include <stdint.h>
@@ -151,6 +153,7 @@ namespace
     struct DebugSnapshot
     {
         wchar_t text[2048] = {};
+        wchar_t source[4096] = {};
         LONG left = 0;
         LONG top = 0;
         LONG right = 0;
@@ -160,6 +163,366 @@ namespace
         int state = 0;
         uint32_t key = 0;
     };
+
+    // Source provenance is deliberately kept separate from the translation
+    // cache.  It is a diagnostic index built from resource reads observed
+    // after the hooks are installed, not a second translation database.
+    struct SourceHandleContext
+    {
+        std::wstring path;
+        ULONGLONG cursor = 0;
+        bool cursorKnown = true;
+    };
+
+    struct SourceReadSnapshot
+    {
+        std::wstring path;
+        ULONGLONG offset = 0;
+        bool offsetKnown = false;
+        std::string bytes;
+        ULONGLONG touch = 0;
+    };
+
+    struct SourceCandidate
+    {
+        std::wstring path;
+        ULONGLONG offset = 0;
+        bool offsetKnown = false;
+    };
+
+    struct SourceProvenanceSpan
+    {
+        int byteStart = 0;
+        int byteLength = 0;
+        bool unknown = false;
+        bool ambiguous = false;
+        std::vector<SourceCandidate> candidates;
+    };
+
+    std::map<HANDLE, SourceHandleContext> g_sourceHandles;
+    std::vector<SourceReadSnapshot> g_sourceSnapshots;
+    SRWLOCK g_sourceLock = SRWLOCK_INIT;
+    ULONGLONG g_sourceTouch = 0;
+    size_t g_sourceCacheBytes = 0;
+    constexpr size_t kSourcePerFileLimit = 512 * 1024;
+    constexpr size_t kSourceGlobalLimit = 8 * 1024 * 1024;
+
+    std::wstring LowercasePath(std::wstring value)
+    {
+        for (wchar_t& ch : value)
+        {
+            if (ch == L'/')
+                ch = L'\\';
+            ch = static_cast<wchar_t>(towlower(ch));
+        }
+        return value;
+    }
+
+    std::wstring NormalizeSourcePath(const std::wstring& input)
+    {
+        if (input.empty())
+            return std::wstring();
+        if (input == L"NUL" || input == L"CON" || input.rfind(L"\\\\.\\", 0) == 0 ||
+            input.rfind(L"\\Device\\", 0) == 0 || input.rfind(L"\\\\?\\GLOBALROOT", 0) == 0)
+            return std::wstring();
+
+        std::wstring path = input;
+        if (path.rfind(L"\\\\?\\", 0) == 0)
+            path.erase(0, 4);
+        wchar_t modulePath[32768] = {};
+        DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath));
+        std::wstring root;
+        if (moduleLength > 0 && moduleLength < ARRAYSIZE(modulePath))
+        {
+            root.assign(modulePath, moduleLength);
+            const size_t slash = root.find_last_of(L"\\/");
+            if (slash != std::wstring::npos)
+                root.resize(slash + 1);
+        }
+
+        const bool relative = !(path.size() >= 2 && path[1] == L':') &&
+            path.rfind(L"\\\\", 0) != 0;
+        if (relative && !root.empty())
+            path = root + path;
+        wchar_t fullPath[32768] = {};
+        DWORD length = GetFullPathNameW(path.c_str(), ARRAYSIZE(fullPath), fullPath, nullptr);
+        if (length > 0 && length < ARRAYSIZE(fullPath))
+            path.assign(fullPath, length);
+
+        const std::wstring lowerPath = LowercasePath(path);
+        const std::wstring lowerRoot = LowercasePath(root);
+        std::wstring display = path;
+        if (!lowerRoot.empty() && lowerPath.rfind(lowerRoot, 0) == 0)
+            display = path.substr(root.size());
+        while (!display.empty() && (display.front() == L'\\' || display.front() == L'/'))
+            display.erase(display.begin());
+        for (wchar_t& ch : display)
+            if (ch == L'\\')
+                ch = L'/';
+        return display;
+    }
+
+    void RemoveSourceSnapshotLocked(size_t index)
+    {
+        if (index >= g_sourceSnapshots.size())
+            return;
+        g_sourceCacheBytes -= g_sourceSnapshots[index].bytes.size();
+        g_sourceSnapshots.erase(g_sourceSnapshots.begin() + index);
+    }
+
+    void EnforceSourceCacheLimitsLocked(const std::wstring& path)
+    {
+        size_t pathBytes = 0;
+        for (const SourceReadSnapshot& snapshot : g_sourceSnapshots)
+            if (snapshot.path == path)
+                pathBytes += snapshot.bytes.size();
+        while (pathBytes > kSourcePerFileLimit)
+        {
+            size_t oldest = g_sourceSnapshots.size();
+            for (size_t i = 0; i < g_sourceSnapshots.size(); ++i)
+            {
+                if (g_sourceSnapshots[i].path == path &&
+                    (oldest == g_sourceSnapshots.size() ||
+                        g_sourceSnapshots[i].touch < g_sourceSnapshots[oldest].touch))
+                    oldest = i;
+            }
+            if (oldest == g_sourceSnapshots.size())
+                break;
+            pathBytes -= g_sourceSnapshots[oldest].bytes.size();
+            RemoveSourceSnapshotLocked(oldest);
+        }
+        while (g_sourceCacheBytes > kSourceGlobalLimit && !g_sourceSnapshots.empty())
+        {
+            size_t oldest = 0;
+            for (size_t i = 1; i < g_sourceSnapshots.size(); ++i)
+                if (g_sourceSnapshots[i].touch < g_sourceSnapshots[oldest].touch)
+                    oldest = i;
+            RemoveSourceSnapshotLocked(oldest);
+        }
+    }
+
+    void MergeSourceSnapshotLocked(const std::wstring& path, ULONGLONG offset,
+        bool offsetKnown, const char* bytes, size_t length)
+    {
+        if (path.empty() || !bytes || length == 0)
+            return;
+        if (length > kSourcePerFileLimit)
+            length = kSourcePerFileLimit;
+
+        SourceReadSnapshot incoming;
+        incoming.path = path;
+        incoming.offset = offset;
+        incoming.offsetKnown = offsetKnown;
+        incoming.bytes.assign(bytes, length);
+        incoming.touch = ++g_sourceTouch;
+
+        if (offsetKnown)
+        {
+            for (size_t i = 0; i < g_sourceSnapshots.size(); )
+            {
+                SourceReadSnapshot& existing = g_sourceSnapshots[i];
+                if (existing.path != path || !existing.offsetKnown)
+                {
+                    ++i;
+                    continue;
+                }
+                const ULONGLONG incomingEnd = incoming.offset + incoming.bytes.size();
+                const ULONGLONG existingEnd = existing.offset + existing.bytes.size();
+                if (incomingEnd < existing.offset || existingEnd < incoming.offset)
+                {
+                    ++i;
+                    continue;
+                }
+
+                const ULONGLONG start = (std::min)(incoming.offset, existing.offset);
+                const ULONGLONG end = (std::max)(incomingEnd, existingEnd);
+                std::string merged(static_cast<size_t>(end - start), '\0');
+                memcpy(&merged[static_cast<size_t>(existing.offset - start)],
+                    existing.bytes.data(), existing.bytes.size());
+                memcpy(&merged[static_cast<size_t>(incoming.offset - start)],
+                    incoming.bytes.data(), incoming.bytes.size());
+                g_sourceCacheBytes -= existing.bytes.size();
+                incoming.offset = start;
+                incoming.bytes.swap(merged);
+                RemoveSourceSnapshotLocked(i);
+                continue;
+            }
+        }
+
+        g_sourceCacheBytes += incoming.bytes.size();
+        g_sourceSnapshots.push_back(std::move(incoming));
+        EnforceSourceCacheLimitsLocked(path);
+    }
+
+    std::vector<SourceCandidate> FindSourceCandidatesLocked(const char* bytes, int length)
+    {
+        std::vector<SourceCandidate> result;
+        if (!bytes || length <= 0)
+            return result;
+        for (const SourceReadSnapshot& snapshot : g_sourceSnapshots)
+        {
+            const char* begin = snapshot.bytes.data();
+            const char* end = begin + snapshot.bytes.size();
+            const char* found = std::search(begin, end, bytes, bytes + length);
+            while (found != end)
+            {
+                SourceCandidate candidate;
+                candidate.path = snapshot.path;
+                candidate.offsetKnown = snapshot.offsetKnown;
+                candidate.offset = snapshot.offsetKnown
+                    ? snapshot.offset + static_cast<ULONGLONG>(found - begin) : 0;
+                bool duplicate = false;
+                for (const SourceCandidate& prior : result)
+                {
+                    if (prior.path == candidate.path &&
+                        prior.offsetKnown == candidate.offsetKnown &&
+                        (!prior.offsetKnown || prior.offset == candidate.offset))
+                    {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate)
+                    result.push_back(candidate);
+                found = std::search(found + 1, end, bytes, bytes + length);
+            }
+        }
+        return result;
+    }
+
+    std::wstring FormatSourceCandidate(const SourceCandidate& candidate)
+    {
+        wchar_t line[768] = {};
+        if (candidate.offsetKnown)
+        {
+            swprintf_s(line, ARRAYSIZE(line), L"%s @0x%llX",
+                candidate.path.c_str(), candidate.offset);
+        }
+        else
+        {
+            swprintf_s(line, ARRAYSIZE(line), L"%s @offset unknown",
+                candidate.path.c_str());
+        }
+        return line;
+    }
+
+    std::wstring FormatSourceProvenance(const std::vector<SourceProvenanceSpan>& spans)
+    {
+        if (spans.empty())
+            return L"Source: source unknown";
+        bool hasUnknown = false;
+        bool hasAmbiguous = false;
+        for (const SourceProvenanceSpan& span : spans)
+        {
+            hasUnknown = hasUnknown || span.unknown;
+            hasAmbiguous = hasAmbiguous || span.ambiguous;
+        }
+        std::wstring result = spans.size() == 1 && !hasUnknown && !hasAmbiguous
+            ? L"Source: " : L"Source spans:\r\n";
+        for (size_t i = 0; i < spans.size(); ++i)
+        {
+            const SourceProvenanceSpan& span = spans[i];
+            if (i > 0 || spans.size() > 1)
+                result += L"[" + std::to_wstring(span.byteStart) + L".." +
+                    std::to_wstring(span.byteStart + span.byteLength - 1) + L"] ";
+            if (span.unknown || span.candidates.empty())
+            {
+                result += L"source unknown";
+            }
+            else if (span.ambiguous)
+            {
+                result += L"source ambiguous: ";
+                for (size_t c = 0; c < span.candidates.size(); ++c)
+                {
+                    if (c > 0)
+                        result += L" | ";
+                    result += FormatSourceCandidate(span.candidates[c]);
+                }
+            }
+            else
+            {
+                result += FormatSourceCandidate(span.candidates.front());
+            }
+            if (spans.size() > 1)
+                result += L"\r\n";
+        }
+        return result;
+    }
+
+    std::wstring ResolveSourceProvenance(const char* bytes, int length)
+    {
+        if (!bytes || length <= 0)
+            return L"Source: source unknown";
+
+        std::vector<SourceProvenanceSpan> spans;
+        AcquireSRWLockShared(&g_sourceLock);
+        std::vector<SourceCandidate> full = FindSourceCandidatesLocked(bytes, length);
+        if (!full.empty())
+        {
+            SourceProvenanceSpan span;
+            span.byteLength = length;
+            span.ambiguous = full.size() > 1;
+            span.candidates = std::move(full);
+            spans.push_back(std::move(span));
+        }
+        else
+        {
+            // Longest-match-first keeps a sentence composed from multiple
+            // reads useful while avoiding a flood of one-character matches.
+            int position = 0;
+            int unknownStart = -1;
+            while (position < length)
+            {
+                int longestLength = 0;
+                std::vector<SourceCandidate> longest;
+                for (int candidateLength = length - position;
+                    candidateLength >= 3; --candidateLength)
+                {
+                    std::vector<SourceCandidate> candidates =
+                        FindSourceCandidatesLocked(bytes + position, candidateLength);
+                    if (!candidates.empty())
+                    {
+                        longestLength = candidateLength;
+                        longest = std::move(candidates);
+                        break;
+                    }
+                }
+                if (longestLength == 0)
+                {
+                    if (unknownStart < 0)
+                        unknownStart = position;
+                    ++position;
+                    continue;
+                }
+                if (unknownStart >= 0)
+                {
+                    SourceProvenanceSpan unknown;
+                    unknown.byteStart = unknownStart;
+                    unknown.byteLength = position - unknownStart;
+                    unknown.unknown = true;
+                    spans.push_back(std::move(unknown));
+                    unknownStart = -1;
+                }
+                SourceProvenanceSpan span;
+                span.byteStart = position;
+                span.byteLength = longestLength;
+                span.ambiguous = longest.size() > 1;
+                span.candidates = std::move(longest);
+                spans.push_back(std::move(span));
+                position += longestLength;
+            }
+            if (unknownStart >= 0)
+            {
+                SourceProvenanceSpan unknown;
+                unknown.byteStart = unknownStart;
+                unknown.byteLength = length - unknownStart;
+                unknown.unknown = true;
+                spans.push_back(std::move(unknown));
+            }
+        }
+        ReleaseSRWLockShared(&g_sourceLock);
+        return FormatSourceProvenance(spans);
+    }
 
     constexpr int kDebugHistoryMaxCapacity = 500;
     DebugSnapshot g_debugHistory[kDebugHistoryMaxCapacity] = {};
@@ -180,6 +543,7 @@ namespace
     constexpr int kDebugCopyCurrentButton = 1011;
     constexpr int kDebugTranslateCapturesCheckbox = 1014;
     constexpr int kDebugHistoryCapacityCombo = 1015;
+    constexpr int kDebugSourceInfo = 1016;
 
     std::string CopyWideText(LPCWSTR text, int count);
     std::string CopyAnsiHex(LPCSTR text, int count);
@@ -1115,6 +1479,7 @@ namespace
         HWND captureToggle = GetDlgItem(hwnd, kDebugTranslateCapturesCheckbox);
         HWND capacityCombo = GetDlgItem(hwnd, kDebugHistoryCapacityCombo);
         HWND info = GetDlgItem(hwnd, 1004);
+        HWND sourceInfo = GetDlgItem(hwnd, kDebugSourceInfo);
         if (historyList)
         {
             SendMessageW(historyList, LB_RESETCONTENT, 0, 0);
@@ -1161,6 +1526,8 @@ namespace
                 snapshot.right, snapshot.bottom, snapshot.state, 932L);
             SetWindowTextW(info, line);
         }
+        if (sourceInfo)
+            SetWindowTextW(sourceInfo, snapshot.source);
     }
 
     LRESULT CALLBACK DebugWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1186,27 +1553,31 @@ namespace
                 10, 165, 560, 85, hwnd, reinterpret_cast<HMENU>(1003), nullptr, nullptr);
             CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                 10, 255, 560, 25, hwnd, reinterpret_cast<HMENU>(1004), nullptr, nullptr);
+            CreateWindowW(L"EDIT", L"Source: source unknown", WS_CHILD | WS_VISIBLE | WS_BORDER |
+                ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+                10, 280, 560, 80, hwnd,
+                reinterpret_cast<HMENU>(kDebugSourceInfo), nullptr, nullptr);
             CreateWindowW(L"STATIC", L"\u624B\u52A8\u539F\u6587:", WS_CHILD | WS_VISIBLE,
-                10, 285, 70, 22, hwnd, nullptr, nullptr, nullptr);
+                10, 370, 70, 22, hwnd, nullptr, nullptr, nullptr);
             CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
                 ES_MULTILINE | WS_VSCROLL,
-                85, 280, 485, 60, hwnd,
+                85, 365, 485, 70, hwnd,
                 reinterpret_cast<HMENU>(kDebugManualSourceEdit), nullptr, nullptr);
             CreateWindowW(L"STATIC", L"\u8BD1\u6587:", WS_CHILD | WS_VISIBLE,
-                10, 350, 70, 22, hwnd, nullptr, nullptr, nullptr);
+                10, 445, 70, 22, hwnd, nullptr, nullptr, nullptr);
             CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
                 ES_MULTILINE | WS_VSCROLL,
-                85, 345, 485, 60, hwnd,
+                85, 440, 485, 70, hwnd,
                 reinterpret_cast<HMENU>(kDebugTranslationEdit), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u901A\u914D\u7B26\u4E8C\u6B21\u6BD4\u5BF9", WS_CHILD | WS_VISIBLE |
                 BS_AUTOCHECKBOX,
-                85, 410, 160, 24, hwnd,
+                85, 515, 160, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugTranslateCapturesCheckbox), nullptr, nullptr);
             CreateWindowW(L"STATIC", L"\u7F13\u5B58\u6761\u6570:", WS_CHILD | WS_VISIBLE,
-                255, 414, 65, 20, hwnd, nullptr, nullptr, nullptr);
+                255, 519, 65, 20, hwnd, nullptr, nullptr, nullptr);
             HWND capacityCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE |
                 WS_BORDER | CBS_DROPDOWNLIST,
-                325, 410, 80, 140, hwnd,
+                325, 515, 80, 140, hwnd,
                 reinterpret_cast<HMENU>(kDebugHistoryCapacityCombo), nullptr, nullptr);
             if (capacityCombo)
             {
@@ -1223,13 +1594,13 @@ namespace
                 SendMessageW(capacityCombo, CB_SETCURSEL, 1, 0);
             }
             CreateWindowW(L"BUTTON", L"\u4FDD\u5B58\u7FFB\u8BD1", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                85, 440, 120, 24, hwnd,
+                85, 550, 120, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugApplyTranslationButton), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u590D\u5236\u5F53\u524D\u539F\u6587", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                210, 440, 120, 24, hwnd,
+                210, 550, 120, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugCopyCurrentButton), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u4FDD\u5B58\u624B\u52A8\u8BB0\u5F55", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                335, 440, 125, 24, hwnd,
+                335, 550, 125, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugManualSaveButton), nullptr, nullptr);
             return 0;
         }
@@ -1375,7 +1746,7 @@ namespace
         RegisterClassW(&wc);
         g_debugWindow = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
             L"WSC3 UI Debug", WS_OVERLAPPEDWINDOW,
-            80, 80, 600, 520, nullptr, nullptr, instance, nullptr);
+            80, 80, 600, 650, nullptr, nullptr, instance, nullptr);
         if (g_debugWindow)
         {
             ShowWindow(g_debugWindow, SW_SHOW);
@@ -1400,7 +1771,8 @@ namespace
     }
 
     void PublishDebugSnapshot(LPCWSTR text, int count, LPRECT rect, UINT format,
-        int state, uint32_t key = 0)
+        int state, uint32_t key = 0, LPCCH sourceBytes = nullptr,
+        int sourceByteCount = 0)
     {
         if (!g_debugWindowEnabled || !g_debugLockInitialized)
             return;
@@ -1414,6 +1786,13 @@ namespace
         if (text && copy > 0)
             memcpy(incoming.text, text, copy * sizeof(wchar_t));
         incoming.text[copy] = L'\0';
+        const std::wstring source = ResolveSourceProvenance(sourceBytes,
+            sourceByteCount);
+        const size_t sourceCopy = (std::min)(source.size(),
+            ARRAYSIZE(incoming.source) - 1);
+        if (sourceCopy > 0)
+            memcpy(incoming.source, source.data(), sourceCopy * sizeof(wchar_t));
+        incoming.source[sourceCopy] = L'\0';
         incoming.count = count;
         incoming.format = format;
         incoming.left = rect ? rect->left : 0;
@@ -1700,7 +2079,8 @@ namespace
                             CopyWideText(g_patchParagraph, g_patchParagraphCount).c_str());
                     PublishDebugSnapshot(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
                         &expanded, format,
-                        3, g_patchParagraphKey);
+                        3, g_patchParagraphKey, g_patchParagraphSourceBytes.data(),
+                        static_cast<int>(g_patchParagraphSourceBytes.size()));
                     return g_drawTextW(dc, g_patchParagraph, g_patchParagraphCount, &expanded, format);
                 }
                 g_patchParagraphPending = false;
@@ -1738,7 +2118,8 @@ namespace
             g_patchParagraphKey = originalKey;
             PublishDebugSnapshot(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
                 rect, format,
-                1, originalKey);
+                1, originalKey, g_patchParagraphSourceBytes.data(),
+                static_cast<int>(g_patchParagraphSourceBytes.size()));
             if (g_patchTrace)
                 log("[PATCHTRACE][A] cache=%d requested=%ld measured=%ld text=\"%s\"\n",
                     g_patchParagraphCount,
@@ -1748,7 +2129,7 @@ namespace
         }
 
         PublishDebugSnapshot(originalText, originalCount, rect, format,
-            (format & DT_WORDBREAK) ? 2 : 0, originalKey);
+            (format & DT_WORDBREAK) ? 2 : 0, originalKey, text, actualCount);
         return g_drawTextW(dc, converted, convertedCount, rect, format);
     }
 
@@ -1771,6 +2152,7 @@ namespace
             ? (text ? lstrlenW(text) : 0) : count;
         std::string sourceBytes;
         std::wstring originalText;
+        uint32_t originalKey = 0;
         if (text && actualCount > 0)
         {
             originalText.assign(text, static_cast<size_t>(actualCount));
@@ -1780,7 +2162,7 @@ namespace
         std::wstring replacement;
         if (!sourceBytes.empty())
         {
-            const uint32_t originalKey = HashRawText(sourceBytes.data(),
+            originalKey = HashRawText(sourceBytes.data(),
                 static_cast<int>(sourceBytes.size()));
             replacement = FindTranslation(originalKey);
             if (replacement.empty())
@@ -1808,6 +2190,9 @@ namespace
                     static_cast<int>(sourceBytes.size()), originalText.data(),
                     actualCount, renderedText, renderedCount, dc, rect, format,
                     requestedWidth);
+            PublishDebugSnapshot(originalText.c_str(), actualCount, rect, format,
+                1, originalKey, sourceBytes.data(),
+                static_cast<int>(sourceBytes.size()));
             return result;
         }
 
@@ -1829,6 +2214,10 @@ namespace
                         log("[PATCHTRACE][W] reflow_rect l=%ld t=%ld r=%ld b=%ld text=\"%s\"\n",
                             expanded.left, expanded.top, expanded.right, expanded.bottom,
                             CopyWideText(g_patchParagraph, g_patchParagraphCount).c_str());
+                    PublishDebugSnapshot(g_patchOriginalParagraph,
+                        g_patchOriginalParagraphCount, &expanded, format, 3,
+                        g_patchParagraphKey, g_patchParagraphSourceBytes.data(),
+                        static_cast<int>(g_patchParagraphSourceBytes.size()));
                     return g_drawTextW(dc, g_patchParagraph, g_patchParagraphCount, &expanded, format);
                 }
                 g_patchParagraphPending = false;
@@ -1837,6 +2226,9 @@ namespace
             else if (g_patchParagraphDrawn)
                 return 0;
         }
+        PublishDebugSnapshot(originalText.c_str(), actualCount, rect, format,
+            (format & DT_WORDBREAK) ? 2 : 0, originalKey, sourceBytes.data(),
+            static_cast<int>(sourceBytes.size()));
         return g_drawTextW(dc, renderedText, renderedCount, rect, format);
     }
 
@@ -2373,6 +2765,94 @@ namespace
         }
         return true;
     }
+}
+
+void TrackSourceFileHandle(HANDLE handle, LPCWSTR path)
+{
+    if (!handle || handle == INVALID_HANDLE_VALUE || !path ||
+        GetFileType(handle) != FILE_TYPE_DISK)
+        return;
+    const std::wstring normalized = NormalizeSourcePath(path);
+    if (normalized.empty())
+        return;
+    AcquireSRWLockExclusive(&g_sourceLock);
+    SourceHandleContext context;
+    context.path = normalized;
+    g_sourceHandles[handle] = std::move(context);
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+void TrackSourceFileHandleA(HANDLE handle, LPCSTR path)
+{
+    if (!path)
+        return;
+    UINT codePage = CP_ACP;
+    int length = MultiByteToWideChar(codePage, 0, path, -1, nullptr, 0);
+    if (length <= 1)
+    {
+        codePage = 932;
+        length = MultiByteToWideChar(codePage, 0, path, -1, nullptr, 0);
+    }
+    if (length <= 1)
+        return;
+    std::vector<wchar_t> converted(static_cast<size_t>(length));
+    if (MultiByteToWideChar(codePage, 0, path, -1, converted.data(), length) <= 0)
+        return;
+    TrackSourceFileHandle(handle, converted.data());
+}
+
+void TrackSourceFileClose(HANDLE handle)
+{
+    if (!handle || handle == INVALID_HANDLE_VALUE)
+        return;
+    AcquireSRWLockExclusive(&g_sourceLock);
+    g_sourceHandles.erase(handle);
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+void TrackSourceFilePointer(HANDLE handle, ULONGLONG newPosition, bool known)
+{
+    AcquireSRWLockExclusive(&g_sourceLock);
+    auto found = g_sourceHandles.find(handle);
+    if (found != g_sourceHandles.end())
+    {
+        found->second.cursor = newPosition;
+        found->second.cursorKnown = known;
+    }
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+void TrackSourceRead(HANDLE handle, LPCVOID buffer, DWORD bytesRead,
+    const OVERLAPPED* overlapped)
+{
+    if (!buffer || bytesRead == 0)
+        return;
+    AcquireSRWLockExclusive(&g_sourceLock);
+    auto found = g_sourceHandles.find(handle);
+    if (found == g_sourceHandles.end())
+    {
+        ReleaseSRWLockExclusive(&g_sourceLock);
+        return;
+    }
+
+    const size_t length = bytesRead < kSourcePerFileLimit
+        ? static_cast<size_t>(bytesRead) : kSourcePerFileLimit;
+    ULONGLONG offset = found->second.cursor;
+    bool offsetKnown = found->second.cursorKnown;
+    if (overlapped)
+    {
+        offset = (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) |
+            overlapped->Offset;
+        offsetKnown = true;
+    }
+    MergeSourceSnapshotLocked(found->second.path, offset, offsetKnown,
+        static_cast<const char*>(buffer), length);
+    if (!overlapped)
+    {
+        if (found->second.cursorKnown)
+            found->second.cursor += bytesRead;
+    }
+    ReleaseSRWLockExclusive(&g_sourceLock);
 }
 
 bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnly,
