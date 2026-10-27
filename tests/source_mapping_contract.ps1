@@ -11,7 +11,11 @@ foreach ($token in @(
     'CreateFileMappingA',
     'MapViewOfFile',
     'UnmapViewOfFile',
-    'mapping source'
+    'mapping source',
+    'SourceTrackingStats',
+    'snapshots=',
+    'mappings=',
+    'views='
 )) {
     if ($ui -notmatch [regex]::Escape($token) -and $version -notmatch [regex]::Escape($token)) {
         throw "Source mapping contract token is missing: $token"

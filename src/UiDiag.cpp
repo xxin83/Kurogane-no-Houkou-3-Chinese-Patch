@@ -1802,8 +1802,18 @@ namespace
         if (text && copy > 0)
             memcpy(incoming.text, text, copy * sizeof(wchar_t));
         incoming.text[copy] = L'\0';
-        const std::wstring source = ResolveSourceProvenance(sourceBytes,
+        std::wstring source = ResolveSourceProvenance(sourceBytes,
             sourceByteCount);
+        if (source.find(L"source unknown") != std::wstring::npos)
+        {
+            const SourceTrackingStats stats = GetSourceTrackingStats();
+            wchar_t status[256] = {};
+            swprintf_s(status, ARRAYSIZE(status),
+                L"\r\ntracking: handles=%lu mappings=%lu views=%lu snapshots=%lu bytes=%llu",
+                stats.handles, stats.mappings, stats.views, stats.snapshots,
+                stats.cachedBytes);
+            source += status;
+        }
         const size_t sourceCopy = (std::min)(source.size(),
             ARRAYSIZE(incoming.source) - 1);
         if (sourceCopy > 0)
@@ -2850,6 +2860,18 @@ void TrackSourceFileMapping(HANDLE mapping, HANDLE file, ULONGLONG mappingSize)
         context.path = found->second.path;
     ReleaseSRWLockShared(&g_sourceLock);
     if (context.path.empty())
+    {
+        using GetFinalPathNameByHandleFn = DWORD(WINAPI*)(HANDLE, LPWSTR, DWORD, DWORD);
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        auto getFinalPath = kernel32
+            ? reinterpret_cast<GetFinalPathNameByHandleFn>(
+                GetProcAddress(kernel32, "GetFinalPathNameByHandleW"))
+            : nullptr;
+        wchar_t finalPath[32768] = {};
+        if (getFinalPath && getFinalPath(file, finalPath, ARRAYSIZE(finalPath), 0) > 0)
+            context.path = NormalizeSourcePath(finalPath);
+    }
+    if (context.path.empty())
         return;
 
     if (mappingSize == 0)
@@ -2920,6 +2942,19 @@ void TrackSourceUnmappedView(LPCVOID view)
     AcquireSRWLockExclusive(&g_sourceLock);
     g_sourceViews.erase(view);
     ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
+SourceTrackingStats GetSourceTrackingStats()
+{
+    SourceTrackingStats stats;
+    AcquireSRWLockShared(&g_sourceLock);
+    stats.handles = static_cast<DWORD>(g_sourceHandles.size());
+    stats.mappings = static_cast<DWORD>(g_sourceMappings.size());
+    stats.views = static_cast<DWORD>(g_sourceViews.size());
+    stats.snapshots = static_cast<DWORD>(g_sourceSnapshots.size());
+    stats.cachedBytes = static_cast<ULONGLONG>(g_sourceCacheBytes);
+    ReleaseSRWLockShared(&g_sourceLock);
+    return stats;
 }
 
 void TrackSourceFilePointer(HANDLE handle, ULONGLONG newPosition, bool known)

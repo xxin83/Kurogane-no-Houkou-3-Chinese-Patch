@@ -23,3 +23,14 @@ void TrackSourceFileMapping(HANDLE mapping, HANDLE file, ULONGLONG mappingSize);
 void TrackSourceMappedView(LPVOID view, HANDLE mapping, ULONGLONG offset,
     SIZE_T bytesToMap);
 void TrackSourceUnmappedView(LPCVOID view);
+
+struct SourceTrackingStats
+{
+    DWORD handles = 0;
+    DWORD mappings = 0;
+    DWORD views = 0;
+    DWORD snapshots = 0;
+    ULONGLONG cachedBytes = 0;
+};
+
+SourceTrackingStats GetSourceTrackingStats();
