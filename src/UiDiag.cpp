@@ -1698,9 +1698,11 @@ namespace
                         log("[PATCHTRACE][A] reflow_rect l=%ld t=%ld r=%ld b=%ld text=\"%s\"\n",
                             expanded.left, expanded.top, expanded.right, expanded.bottom,
                             CopyWideText(g_patchParagraph, g_patchParagraphCount).c_str());
+#ifndef WSC3_GAME_RELEASE
                     PublishDebugSnapshot(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
                         &expanded, format,
                         3, g_patchParagraphKey);
+#endif
                     return g_drawTextW(dc, g_patchParagraph, g_patchParagraphCount, &expanded, format);
                 }
                 g_patchParagraphPending = false;
@@ -1736,9 +1738,11 @@ namespace
             CachePatchParagraph(text, actualCount, originalText, originalCount,
                 converted, convertedCount, dc, rect, format, requestedWidth);
             g_patchParagraphKey = originalKey;
+#ifndef WSC3_GAME_RELEASE
             PublishDebugSnapshot(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
                 rect, format,
                 1, originalKey);
+#endif
             if (g_patchTrace)
                 log("[PATCHTRACE][A] cache=%d requested=%ld measured=%ld text=\"%s\"\n",
                     g_patchParagraphCount,
@@ -1747,8 +1751,10 @@ namespace
             return result;
         }
 
+#ifndef WSC3_GAME_RELEASE
         PublishDebugSnapshot(originalText, originalCount, rect, format,
             (format & DT_WORDBREAK) ? 2 : 0, originalKey);
+#endif
         return g_drawTextW(dc, converted, convertedCount, rect, format);
     }
 
@@ -2401,8 +2407,10 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
     ResolveTranslationPath();
     LoadTranslations();
 
+#ifndef WSC3_GAME_RELEASE
     if (g_debugWindowEnabled)
         StartDebugWindow();
+#endif
 
     bool ok = true;
     if (!g_patchOnly && g_logMetrics)

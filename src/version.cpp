@@ -12,6 +12,7 @@
 #include "MemHack.h"
 #include "Config.h"
 #include "UiDiag.h"
+#include "FrameLimiter.h"
 #include <ntddscsi.h>
 #include <map>
 #include <stdlib.h>
@@ -1057,6 +1058,12 @@ DWORD WINAPI Load(LPVOID lpParam)
 		return 0;
 	}
 
+	InstallFrameLimiterFromGameIni();
+
+	#ifdef WSC3_GAME_RELEASE
+	InstallUiDiagnostics(false, false, false, false, false, 100, true, true,
+		false, false, 932, true, false, true);
+	#else
 	if (config.GetBool("uiDiagnostics"))
 	{
 		InstallUiDiagnostics(
@@ -1075,6 +1082,7 @@ DWORD WINAPI Load(LPVOID lpParam)
 			config.GetBool("uiCaptureShipData", false),
 			config.GetBool("uiForceCp932", false));
 	}
+	#endif
 
 	if ((status = MH_CreateHookApi(L"kernel32", "CreateProcessA", &CreateProcessA_Hook, reinterpret_cast<LPVOID*>(&CreateProcessA_Orig))) != MH_OK)
 	{
