@@ -1,10 +1,10 @@
-# Valkyria Chronicles 3 中文化补丁
+# 钢铁的咆哮 3（Kurogane no Houkou 3）中文化补丁
 
-这是面向中文用户的 Valkyria Chronicles 3（WSC3，工程目录名为 `KH3`）运行时汉化补丁基准工程。
+这是面向中文用户的钢铁的咆哮 3（Kurogane no Houkou 3，WSC3，工程目录名为 `KH3`）运行时汉化补丁基准工程。
 
 ## 项目说明
 
-本仓库保存 Valkyria Chronicles 3（WSC3）运行时汉化补丁的基准源码。
+本仓库保存 Kurogane no Houkou 3（WSC3）运行时汉化补丁的基准源码。
 
 最新版本：[2026-11-01 更新说明：战斗限速与日常游戏版](更新说明-2026-11-01-帧率限制与日常版.md)。
 
@@ -153,7 +153,7 @@ Release 构建定义 `WSC3_RELEASE_NO_LOGGING` 和 `WSC3_GAME_RELEASE`，移除�
 <details>
 <summary>原 SafeDiscLoader2 英文资料（展开查看）</summary>
 
-## Valkyria Chronicles 3 Chinese patch baseline
+## Kurogane no Houkou 3 Chinese patch baseline
 
 This repository contains the WSC3/KH3 runtime translation patch. It preserves the SafeDiscLoader2 `version.dll` proxy and adds runtime CP932 text identity, Chinese translation lookup, `DrawTextA/W` interception, and the historical paragraph reflow compatibility path.
 
