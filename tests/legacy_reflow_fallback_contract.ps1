@@ -7,11 +7,11 @@ if ($source -match 'if\s*\(!strictReplayActive\s*&&\s*\(format\s*&\s*DT_WORDBREA
     throw 'Legacy paragraph reflow must remain available after strict replay state is active.'
 }
 
-if ($source -notmatch 'log\("\[PATCHTRACE\]\[A\] reflow cached=') {
+if ($source -notmatch '(log|WSC3_PATCH_TRACE)\("\[PATCHTRACE\]\[A\] reflow cached=') {
     throw 'DrawTextA must retain the legacy reflow path.'
 }
 
-if ($source -notmatch 'log\("\[PATCHTRACE\]\[W\] reflow cached=') {
+if ($source -notmatch '(log|WSC3_PATCH_TRACE)\("\[PATCHTRACE\]\[W\] reflow cached=') {
     throw 'DrawTextW must retain the legacy reflow path.'
 }
 

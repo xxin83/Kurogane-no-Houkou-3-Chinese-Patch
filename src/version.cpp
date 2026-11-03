@@ -429,7 +429,9 @@ HANDLE WINAPI CreateFileA_Hook(LPCSTR lpFileName, DWORD dwDesiredAccess, DWORD d
 
 	if (logCreateFile)
 		log("CreateFileA_Hook Hook - lpFileName: %s ret: %08X\n", lpFileName == NULL ? "!NULL!" : lpFileName, ret);
+	#ifndef WSC3_MINIMAL_RELEASE
 	TrackSourceFileHandleA(ret, lpFileName);
+	#endif
 
 	return ret;
 }
@@ -448,7 +450,9 @@ HANDLE WINAPI CreateFileA_Hook_KBase(LPCSTR lpFileName, DWORD dwDesiredAccess, D
 
 	if (logCreateFile)
 		log("CreateFileA_Hook_KBase Hook - lpFileName: %s ret: %08X\n", lpFileName == NULL ? "!NULL!" : lpFileName, ret);
+	#ifndef WSC3_MINIMAL_RELEASE
 	TrackSourceFileHandleA(ret, lpFileName);
+	#endif
 
 	return ret;
 }
@@ -464,10 +468,13 @@ HANDLE WINAPI CreateFileW_Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD 
 	
 	HANDLE ret = CreateFileW_Orig(lpFileName, dwDesiredAccess, dwShareMode,
 		lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+	#ifndef WSC3_MINIMAL_RELEASE
 	TrackSourceFileHandle(ret, lpFileName);
+	#endif
 	return ret;
 }
 
+#ifndef WSC3_MINIMAL_RELEASE
 BOOL WINAPI ReadFile_Hook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead,
 	LPDWORD lpNumberOfBytesRead, LPOVERLAPPED lpOverlapped)
 {
@@ -565,6 +572,7 @@ BOOL WINAPI UnmapViewOfFile_Hook(LPCVOID baseAddress)
 		TrackSourceUnmappedView(baseAddress);
 	return result;
 }
+#endif
 
 BOOL WINAPI CreateProcessA_Hook(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
 {
@@ -1134,9 +1142,40 @@ HMODULE WINAPI LoadLibraryA_26_Hook(LPCSTR lpLibFileName);
 HMODULE WINAPI LoadLibraryA_27and28_Hook(LPCSTR lpLibFileName);
 void HookOEP(HINSTANCE hModule);
 
+static bool ReadGameIniBool(const char* key, bool fallback)
+{
+	if (!key || !*key)
+		return fallback;
+
+	char path[MAX_PATH] = {};
+	const DWORD length = GetModuleFileNameA(nullptr, path, MAX_PATH);
+	char* separator = length > 0 && length < MAX_PATH ? strrchr(path, '\\') : nullptr;
+	if (!separator || static_cast<size_t>(separator - path) + sizeof("\\debug.ini") > MAX_PATH)
+		return fallback;
+
+	lstrcpyA(separator + 1, "debug.ini");
+	const UINT missing = static_cast<UINT>(-1);
+	const UINT value = GetPrivateProfileIntA("Common", key, missing, path);
+	return value == missing ? fallback : value != 0;
+}
+
 DWORD WINAPI Load(LPVOID lpParam) 
 {
-	config.LoadConfig("version.json");
+	bool configLoaded = false;
+	char moduleConfigPath[MAX_PATH] = {};
+	if (GetModuleFileNameA(reinterpret_cast<HMODULE>(lpParam), moduleConfigPath,
+		static_cast<DWORD>(sizeof(moduleConfigPath))) > 0)
+	{
+		char* separator = strrchr(moduleConfigPath, '\\');
+		if (separator)
+		{
+			lstrcpyA(separator + 1, "version.json");
+			configLoaded = config.LoadConfig(moduleConfigPath);
+		}
+	}
+	if (!configLoaded)
+		configLoaded = config.LoadConfig("version.json");
+	const bool useEmbeddedCleanDefaults = !configLoaded;
 
 #ifndef WSC3_RELEASE_NO_LOGGING
 	if (config.GetBool("logging"))
@@ -1168,6 +1207,9 @@ DWORD WINAPI Load(LPVOID lpParam)
 
 	char szExeFile[MAX_PATH];
 	GetModuleFileNameA(NULL, szExeFile, MAX_PATH);
+	const char* exeBaseName = strrchr(szExeFile, '\\');
+	exeBaseName = exeBaseName ? exeBaseName + 1 : szExeFile;
+	const bool isGameProcess = _stricmp(exeBaseName, "wsc3.exe") == 0;
 	NString csExeFile = szExeFile;
 	NString csCommandLine = GetCommandLine();
 
@@ -1193,23 +1235,84 @@ DWORD WINAPI Load(LPVOID lpParam)
 		return 0;
 	}
 
-	if (config.GetBool("uiDiagnostics"))
+	#ifdef WSC3_MINIMAL_RELEASE
+	const bool enableUiDiagnostics = true;
+	#else
+	#ifdef WSC3_FULL_DEBUG
+	const bool debugUiJsonDefault = config.GetBool("uiDebugWindow", true);
+	#else
+	const bool debugUiJsonDefault = config.GetBool("uiDebugWindow", false);
+	#endif
+	// Explicit [Common] switches in the game directory override version.json.
+	// Missing keys preserve the existing JSON/embedded-default behavior.
+	const bool debugUiEnabled = ReadGameIniBool("WSC3DebugUI", debugUiJsonDefault);
+	const bool layoutTunerWindow = debugUiEnabled && ReadGameIniBool(
+		"WSC3LayoutTuner", config.GetBool("uiLayoutTunerWindow", false));
+	const bool sourceTrackingEnabled = debugUiEnabled && ReadGameIniBool(
+		"WSC3SourceTracking", config.GetBool("uiSourceTracking", false));
+	#ifdef WSC3_LAYOUT_TUNER_ONLY
+	const bool layoutTunerOnly = true;
+	#else
+	const bool layoutTunerOnly = config.GetBool("uiLayoutTunerOnly", false);
+	#endif
+	#ifdef WSC3_FULL_DEBUG
+	// The full Debug DLL always keeps the translation/patch hook chain active
+	// for the game.  WSC3DebugUI controls only the diagnostic layer.
+	const bool enableUiDiagnostics = isGameProcess && !layoutTunerOnly;
+	#else
+	const bool enableUiDiagnostics =
+		config.GetBool("uiDiagnostics", useEmbeddedCleanDefaults) || debugUiEnabled || layoutTunerWindow;
+	#endif
+	#endif
+	const bool cp932EnvironmentOnly = config.GetBool("uiCp932EnvironmentOnly", false);
+	#ifdef WSC3_MINIMAL_RELEASE
+	const bool debugWindowEnabled = false;
+	const bool sourceTrackingEnabled = false;
+	#else
+	const bool debugWindowEnabled = isGameProcess && debugUiEnabled;
+	#endif
+	const bool forceXpTextMetrics = config.GetBool("uiForceXpTextMetrics", false);
+	if (layoutTunerOnly)
 	{
+		if (isGameProcess && !InstallLayoutTunerHooks())
+			return 0;
+	}
+	else if (forceXpTextMetrics)
+	{
+		InstallCp932XpTextMetricsHooks();
+	}
+	else if (cp932EnvironmentOnly)
+	{
+		InstallCp932CompatibilityHooks();
+	}
+	else if (enableUiDiagnostics)
+	{
+		#ifdef WSC3_MINIMAL_RELEASE
 		InstallUiDiagnostics(
-			config.GetBool("uiLogText", true),
-			config.GetBool("uiLogMetrics", true),
+			false, false, false, false, false, 100, true, true, false, false,
+			932, false, true, false, false);
+		#else
+		const bool patchOnlyEnabled =
+			config.GetBool("uiPatchOnly", useEmbeddedCleanDefaults) || !debugUiEnabled;
+		InstallUiDiagnostics(
+			config.GetBool("uiLogText", useEmbeddedCleanDefaults ? false : true) && debugUiEnabled,
+			config.GetBool("uiLogMetrics", useEmbeddedCleanDefaults ? false : true) && debugUiEnabled,
 			config.GetBool("uiTargetTextWidthOnly", false),
 			config.GetBool("uiDoubleTargetWidth", false),
 			config.GetBool("uiNarrowTargetFont", false),
 			config.GetValue("uiTargetFontScale") ? atoi(config.GetValue("uiTargetFontScale")) : 100,
-			config.GetBool("uiReflowTargetText", false),
-			config.GetBool("uiPatchOnly", false),
-			config.GetBool("uiPatchTrace", false),
-			config.GetBool("uiDebugWindow", false),
-			(config.GetValue("uiTextEncoding") && _stricmp(config.GetValue("uiTextEncoding"), "cp932") == 0) ? 932 : 936,
-			config.GetBool("uiOriginalNullGuard", true),
-			config.GetBool("uiCaptureShipData", false),
-			config.GetBool("uiForceCp932", false));
+			config.GetBool("uiReflowTargetText", useEmbeddedCleanDefaults),
+			patchOnlyEnabled,
+			config.GetBool("uiPatchTrace", false) && debugUiEnabled,
+			debugWindowEnabled,
+			(config.GetValue("uiTextEncoding") && _stricmp(config.GetValue("uiTextEncoding"), "cp932") == 0) ? 932 :
+				(useEmbeddedCleanDefaults ? 932 : 936),
+			config.GetBool("uiCaptureShipData", false) && debugUiEnabled,
+			config.GetBool("uiForceCp932", useEmbeddedCleanDefaults),
+				config.GetBool("uiD3D8FrameTrace", false) && debugUiEnabled,
+				isGameProcess && layoutTunerWindow,
+				sourceTrackingEnabled);
+		#endif
 	}
 
 	if ((status = MH_CreateHookApi(L"kernel32", "CreateProcessA", &CreateProcessA_Hook, reinterpret_cast<LPVOID*>(&CreateProcessA_Orig))) != MH_OK)
@@ -1269,10 +1372,11 @@ DWORD WINAPI Load(LPVOID lpParam)
 		return 0;
 	}
 
+	#ifndef WSC3_MINIMAL_RELEASE
 	// The source index is only needed while the diagnostics UI is active.
 	// Keeping these hooks opt-in avoids adding ReadFile bookkeeping to normal
 	// release play while preserving the existing CreateFile compatibility hooks.
-	if (config.GetBool("uiDiagnostics") && config.GetBool("uiDebugWindow", false))
+	if (isGameProcess && enableUiDiagnostics && debugWindowEnabled && !layoutTunerOnly)
 	{
 		if (MH_CreateHookApi(L"kernel32", "ReadFile", &ReadFile_Hook,
 			reinterpret_cast<LPVOID*>(&ReadFile_Orig)) != MH_OK)
@@ -1299,6 +1403,7 @@ DWORD WINAPI Load(LPVOID lpParam)
 			reinterpret_cast<LPVOID*>(&UnmapViewOfFile_Orig)) != MH_OK)
 			log("Unable to hook UnmapViewOfFile for source provenance\n");
 	}
+	#endif
 
 	auto LoadLibrayHook = &LoadLibraryA_Hook;	// For Safedisc 2.9 and above
 	if (SafeDiscVersion == 2 && SafeDiscSubVersion < 90)

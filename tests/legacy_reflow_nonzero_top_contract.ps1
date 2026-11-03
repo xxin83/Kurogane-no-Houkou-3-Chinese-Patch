@@ -4,7 +4,7 @@ $sourcePath = Join-Path $PSScriptRoot '..\src\UiDiag.cpp'
 $source = Get-Content -LiteralPath $sourcePath -Raw
 $replay = [regex]::Match(
     $source,
-    '(?s)bool ReplayHistoricalPatchParagraph\(.*?\n    \}\n\n    void UpdateDebugControls'
+    '(?s)bool ReplayHistoricalPatchParagraph\(.*?\r?\n    \}\r?\n\r?\n    void UpdateDebugControls'
 ).Value
 
 if ([string]::IsNullOrEmpty($replay)) {

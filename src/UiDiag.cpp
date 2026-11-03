@@ -8,6 +8,10 @@
 #include <vector>
 #include <stdint.h>
 #include "UiDiag.h"
+#include "LayoutTuner.h"
+#include "LayoutTunerWindow.h"
+#include "XpCp932Width.h"
+#include "FrameLimiter.h"
 #include "Utils.h"
 #include "minhook/MinHook.h"
 
@@ -49,12 +53,13 @@ namespace
     bool g_patchTrace = false;
     bool g_captureShipData = false;
     bool g_forceSystemCp932 = false;
-    volatile LONG g_originalNullGuardRetryPending = 0;
     volatile LONG g_shipLookupHookInstalled = 0;
     UINT g_patchTextCodePage = 936;
     bool g_debugWindowEnabled = false;
     HWND g_debugWindow = nullptr;
     DWORD g_debugThreadId = 0;
+    volatile LONG g_debugWindowStartState = 0;
+    HANDLE g_debugWindowInstanceMutex = nullptr;
     volatile LONG g_debugSourceCodePage = 932;
     CRITICAL_SECTION g_debugLock;
     bool g_debugLockInitialized = false;
@@ -91,6 +96,7 @@ namespace
     using TextOutWFn = BOOL (WINAPI*)(HDC, int, int, LPCWSTR, int);
     using GetTextExtentPoint32AFn = BOOL (WINAPI*)(HDC, LPCSTR, int, LPSIZE);
     using GetTextExtentPoint32WFn = BOOL (WINAPI*)(HDC, LPCWSTR, int, LPSIZE);
+    using GetTextMetricsAFn = BOOL (WINAPI*)(HDC, LPTEXTMETRICA);
     using DrawTextAFn = int (WINAPI*)(HDC, LPCSTR, int, LPRECT, UINT);
     using DrawTextWFn = int (WINAPI*)(HDC, LPCWSTR, int, LPRECT, UINT);
     using ShipLookupFn = int (__thiscall*)(void*, int, int);
@@ -116,6 +122,7 @@ namespace
     TextOutWFn g_textOutW = nullptr;
     GetTextExtentPoint32AFn g_getTextExtentA = nullptr;
     GetTextExtentPoint32WFn g_getTextExtentW = nullptr;
+    GetTextMetricsAFn g_getTextMetricsA = nullptr;
     DrawTextAFn g_drawTextA = nullptr;
     DrawTextWFn g_drawTextW = nullptr;
     ShipLookupFn g_shipLookupOriginal = nullptr;
@@ -131,6 +138,11 @@ namespace
     Direct3DCreate8Fn g_direct3DCreate8 = nullptr;
     D3DCreateDeviceFn g_d3dCreateDevice = nullptr;
     bool g_d3dCreateDeviceHooked = false;
+    bool g_d3d8FrameTrace = false;
+    bool g_forceXpTextMetrics = false;
+    bool g_layoutTunerEnabled = false;
+    bool g_layoutTunerOnly = false;
+    volatile LONG g_xpDrawEvents = 0;
     wchar_t g_patchParagraph[8192] = {};
     int g_patchParagraphCount = 0;
     wchar_t g_patchOriginalParagraph[8192] = {};
@@ -218,10 +230,16 @@ namespace
     std::map<LPCVOID, SourceMappedViewContext> g_sourceViews;
     std::vector<SourceReadSnapshot> g_sourceSnapshots;
     SRWLOCK g_sourceLock = SRWLOCK_INIT;
+    volatile LONG g_sourceTrackingEnabled = 0;
     ULONGLONG g_sourceTouch = 0;
     size_t g_sourceCacheBytes = 0;
     constexpr size_t kSourcePerFileLimit = 512 * 1024;
     constexpr size_t kSourceGlobalLimit = 8 * 1024 * 1024;
+
+    bool IsSourceTrackingEnabledInternal()
+    {
+        return InterlockedCompareExchange(&g_sourceTrackingEnabled, 0, 0) != 0;
+    }
 
     std::wstring LowercasePath(std::wstring value)
     {
@@ -559,6 +577,8 @@ namespace
     constexpr int kDebugTranslateCapturesCheckbox = 1014;
     constexpr int kDebugHistoryCapacityCombo = 1015;
     constexpr int kDebugSourceInfo = 1016;
+    constexpr int kDebugSourceTrackingButton = 1017;
+    constexpr int kDebugSourceClearButton = 1018;
 
     std::string CopyWideText(LPCWSTR text, int count);
     std::string CopyAnsiHex(LPCSTR text, int count);
@@ -567,6 +587,18 @@ namespace
     void CaptureShipTextA(LPCSTR text, int count, LPRECT rect, UINT format,
         uintptr_t caller, LPCWSTR original, int originalCount,
         LPCWSTR rendered, int renderedCount, uint32_t key);
+
+#ifdef WSC3_MINIMAL_RELEASE
+#define WSC3_PUBLISH_DEBUG_SNAPSHOT(...) ((void)0)
+#else
+#define WSC3_PUBLISH_DEBUG_SNAPSHOT(...) PublishDebugSnapshot(__VA_ARGS__)
+#endif
+
+#ifdef WSC3_MINIMAL_RELEASE
+#define WSC3_PATCH_TRACE(...) ((void)0)
+#else
+#define WSC3_PATCH_TRACE(...) do { if (g_patchTrace) log(__VA_ARGS__); } while (0)
+#endif
 
     int HistorySlotAtDisplayIndexLocked(int index)
     {
@@ -1117,52 +1149,10 @@ namespace
     constexpr uintptr_t kParagraphMeasureCaller = 0x0049B324;
     constexpr uintptr_t kParagraphDrawCaller = 0x0049B9F0;
 
-    // WSC3 1.1.0.3: when the completed-ship path has no ship table, the
-    // original code branches to 004B042E and dereferences EDX+0x2B0 while
-    // EDX is null.  004B0445 is the existing ret 8 path for this routine.
-    constexpr uintptr_t kOriginalNullGuardRva = 0x000B041D;
-    constexpr BYTE kOriginalNullGuardOriginalByte = 0x10;
-    constexpr BYTE kOriginalNullGuardPatchedByte = 0x27;
+    bool TryApplyLayoutTunerMeasure(HDC dc, LPCSTR text, int count, LPRECT rect,
+        UINT format, uintptr_t callerAddress);
 
-    bool ApplyOriginalNullGuard(bool enabled, bool quietUnexpected = false)
-    {
-        if (!enabled)
-            return false;
-
-        char modulePath[MAX_PATH] = {};
-        GetModuleFileNameA(nullptr, modulePath, ARRAYSIZE(modulePath));
-        const char* fileName = strrchr(modulePath, '\\');
-        fileName = fileName ? fileName + 1 : modulePath;
-        if (_stricmp(fileName, "wsc3.exe") != 0)
-            return false;
-
-        BYTE* patch = reinterpret_cast<BYTE*>(
-            reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) +
-            kOriginalNullGuardRva);
-        if (!patch || *patch != kOriginalNullGuardOriginalByte)
-        {
-            if (!quietUnexpected)
-                log("[ORIGFIX] null guard skipped: unexpected byte at RVA 0x%08lX\n",
-                    static_cast<unsigned long>(kOriginalNullGuardRva));
-            return false;
-        }
-
-        DWORD oldProtect = 0;
-        if (!VirtualProtect(patch, 1, PAGE_EXECUTE_READWRITE, &oldProtect))
-        {
-            log("[ORIGFIX] null guard VirtualProtect failed: %lu\n", GetLastError());
-            return false;
-        }
-        *patch = kOriginalNullGuardPatchedByte;
-        FlushInstructionCache(GetCurrentProcess(), patch, 1);
-        DWORD ignored = 0;
-        VirtualProtect(patch, 1, oldProtect, &ignored);
-        log("[ORIGFIX] null guard enabled: RVA=0x%08lX byte=0x%02X\n",
-            static_cast<unsigned long>(kOriginalNullGuardRva),
-            static_cast<unsigned int>(*patch));
-        return true;
-    }
-
+#ifndef WSC3_MINIMAL_RELEASE
     constexpr uintptr_t kShipLookupRva = 0x000B03F0;
     constexpr LONG kMaxShipTraceLines = 256;
 
@@ -1308,6 +1298,7 @@ namespace
         log("[SHIPDATA] hook enabled: RVA=0x%08lX\n",
             static_cast<unsigned long>(kShipLookupRva));
     }
+#endif
 
     bool IsHistoricalParagraphMeasure(uintptr_t caller)
     {
@@ -1402,8 +1393,7 @@ namespace
                     g_patchLayoutLastRenderedHeight + originalTrailingGap;
                 g_patchLayoutVerticalOffset += desiredParagraphSpan -
                     originalParagraphSpan;
-                if (g_patchTrace)
-                    log("[PATCHTRACE] layout previousHeight=%ld originalSpan=%ld "
+                WSC3_PATCH_TRACE("[PATCHTRACE] layout previousHeight=%ld originalSpan=%ld "
                         "trailingGap=%ld delta=%ld offset=%ld\n",
                         g_patchLayoutLastRenderedHeight, originalParagraphSpan,
                         originalTrailingGap,
@@ -1425,8 +1415,7 @@ namespace
             g_patchLayoutLastRenderedHeight = renderedHeight > 0
                 ? renderedHeight : g_patchLayoutLastLineHeight;
             g_patchLayoutHasLast = true;
-            if (g_patchTrace)
-                log("[PATCHTRACE] replay top=%ld drawTop=%ld width=%ld "
+            WSC3_PATCH_TRACE("[PATCHTRACE] replay top=%ld drawTop=%ld width=%ld "
                     "height=%ld count=%d\n", rect->top, expanded.top,
                     rect->right - rect->left, g_patchLayoutLastRenderedHeight,
                     g_patchParagraphCount);
@@ -1495,6 +1484,7 @@ namespace
         HWND capacityCombo = GetDlgItem(hwnd, kDebugHistoryCapacityCombo);
         HWND info = GetDlgItem(hwnd, 1004);
         HWND sourceInfo = GetDlgItem(hwnd, kDebugSourceInfo);
+        HWND sourceTracking = GetDlgItem(hwnd, kDebugSourceTrackingButton);
         if (historyList)
         {
             SendMessageW(historyList, LB_RESETCONTENT, 0, 0);
@@ -1543,6 +1533,11 @@ namespace
         }
         if (sourceInfo)
             SetWindowTextW(sourceInfo, snapshot.source);
+        if (sourceTracking)
+        {
+            SendMessageW(sourceTracking, BM_SETCHECK,
+                IsSourceTrackingEnabledInternal() ? BST_CHECKED : BST_UNCHECKED, 0);
+        }
     }
 
     LRESULT CALLBACK DebugWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1572,27 +1567,35 @@ namespace
                 ES_MULTILINE | ES_READONLY | WS_VSCROLL,
                 10, 280, 560, 80, hwnd,
                 reinterpret_cast<HMENU>(kDebugSourceInfo), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"\u6765\u6E90\u8FFD\u8E2A", WS_CHILD | WS_VISIBLE |
+                BS_AUTOCHECKBOX,
+                10, 365, 120, 24, hwnd,
+                reinterpret_cast<HMENU>(kDebugSourceTrackingButton), nullptr, nullptr);
+            CreateWindowW(L"BUTTON", L"\u6E05\u7A7A\u6765\u6E90\u7F13\u5B58", WS_CHILD | WS_VISIBLE |
+                BS_PUSHBUTTON,
+                135, 365, 130, 24, hwnd,
+                reinterpret_cast<HMENU>(kDebugSourceClearButton), nullptr, nullptr);
             CreateWindowW(L"STATIC", L"\u624B\u52A8\u539F\u6587:", WS_CHILD | WS_VISIBLE,
-                10, 370, 70, 22, hwnd, nullptr, nullptr, nullptr);
+                10, 400, 70, 22, hwnd, nullptr, nullptr, nullptr);
             CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
                 ES_MULTILINE | WS_VSCROLL,
-                85, 365, 485, 70, hwnd,
+                85, 395, 485, 70, hwnd,
                 reinterpret_cast<HMENU>(kDebugManualSourceEdit), nullptr, nullptr);
             CreateWindowW(L"STATIC", L"\u8BD1\u6587:", WS_CHILD | WS_VISIBLE,
-                10, 445, 70, 22, hwnd, nullptr, nullptr, nullptr);
+                10, 475, 70, 22, hwnd, nullptr, nullptr, nullptr);
             CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER |
                 ES_MULTILINE | WS_VSCROLL,
-                85, 440, 485, 70, hwnd,
+                85, 470, 485, 70, hwnd,
                 reinterpret_cast<HMENU>(kDebugTranslationEdit), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u901A\u914D\u7B26\u4E8C\u6B21\u6BD4\u5BF9", WS_CHILD | WS_VISIBLE |
                 BS_AUTOCHECKBOX,
-                85, 515, 160, 24, hwnd,
+                85, 545, 160, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugTranslateCapturesCheckbox), nullptr, nullptr);
             CreateWindowW(L"STATIC", L"\u7F13\u5B58\u6761\u6570:", WS_CHILD | WS_VISIBLE,
-                255, 519, 65, 20, hwnd, nullptr, nullptr, nullptr);
+                255, 549, 65, 20, hwnd, nullptr, nullptr, nullptr);
             HWND capacityCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE |
                 WS_BORDER | CBS_DROPDOWNLIST,
-                325, 515, 80, 140, hwnd,
+                325, 545, 80, 140, hwnd,
                 reinterpret_cast<HMENU>(kDebugHistoryCapacityCombo), nullptr, nullptr);
             if (capacityCombo)
             {
@@ -1609,13 +1612,13 @@ namespace
                 SendMessageW(capacityCombo, CB_SETCURSEL, 1, 0);
             }
             CreateWindowW(L"BUTTON", L"\u4FDD\u5B58\u7FFB\u8BD1", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                85, 550, 120, 24, hwnd,
+                85, 580, 120, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugApplyTranslationButton), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u590D\u5236\u5F53\u524D\u539F\u6587", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                210, 550, 120, 24, hwnd,
+                210, 580, 120, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugCopyCurrentButton), nullptr, nullptr);
             CreateWindowW(L"BUTTON", L"\u4FDD\u5B58\u624B\u52A8\u8BB0\u5F55", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                335, 550, 125, 24, hwnd,
+                335, 580, 125, 24, hwnd,
                 reinterpret_cast<HMENU>(kDebugManualSaveButton), nullptr, nullptr);
             return 0;
         }
@@ -1647,6 +1650,22 @@ namespace
                 HWND toggle = GetDlgItem(hwnd, kDebugHideTranslatedButton);
                 g_debugHideTranslated = SendMessageW(toggle, BM_GETCHECK, 0, 0) ==
                     BST_CHECKED;
+                UpdateDebugControls(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kDebugSourceTrackingButton &&
+                HIWORD(wParam) == BN_CLICKED)
+            {
+                HWND toggle = GetDlgItem(hwnd, kDebugSourceTrackingButton);
+                SetSourceTrackingEnabled(toggle &&
+                    SendMessageW(toggle, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                UpdateDebugControls(hwnd);
+                return 0;
+            }
+            if (LOWORD(wParam) == kDebugSourceClearButton &&
+                HIWORD(wParam) == BN_CLICKED)
+            {
+                ClearSourceTrackingCache();
                 UpdateDebugControls(hwnd);
                 return 0;
             }
@@ -1742,7 +1761,13 @@ namespace
             UpdateDebugControls(hwnd);
             return 0;
         case WM_DESTROY:
-            g_debugWindow = nullptr;
+            InterlockedExchangePointer(reinterpret_cast<PVOID*>(&g_debugWindow), nullptr);
+            if (g_debugWindowInstanceMutex)
+            {
+                CloseHandle(g_debugWindowInstanceMutex);
+                g_debugWindowInstanceMutex = nullptr;
+            }
+            InterlockedExchange(&g_debugWindowStartState, 0);
             PostQuitMessage(0);
             return 0;
         }
@@ -1759,13 +1784,24 @@ namespace
         wc.lpszClassName = L"Wsc3UiDebugWindow";
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
         RegisterClassW(&wc);
-        g_debugWindow = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
+        HWND window = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
             L"WSC3 UI Debug", WS_OVERLAPPEDWINDOW,
-            80, 80, 600, 650, nullptr, nullptr, instance, nullptr);
-        if (g_debugWindow)
+            80, 80, 600, 680, nullptr, nullptr, instance, nullptr);
+        InterlockedExchangePointer(reinterpret_cast<PVOID*>(&g_debugWindow), window);
+        if (window)
         {
-            ShowWindow(g_debugWindow, SW_SHOW);
-            UpdateWindow(g_debugWindow);
+            ShowWindow(window, SW_SHOW);
+            UpdateWindow(window);
+        }
+        else
+        {
+            if (g_debugWindowInstanceMutex)
+            {
+                CloseHandle(g_debugWindowInstanceMutex);
+                g_debugWindowInstanceMutex = nullptr;
+            }
+            InterlockedExchange(&g_debugWindowStartState, 0);
+            return 0;
         }
         MSG message;
         while (GetMessageW(&message, nullptr, 0, 0) > 0)
@@ -1773,16 +1809,65 @@ namespace
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        if (g_debugWindowInstanceMutex)
+        {
+            CloseHandle(g_debugWindowInstanceMutex);
+            g_debugWindowInstanceMutex = nullptr;
+        }
+        InterlockedExchange(&g_debugWindowStartState, 0);
         return 0;
     }
 
     void StartDebugWindow()
     {
-        if (g_debugLockInitialized)
+        if (InterlockedCompareExchange(&g_debugWindowStartState, 1, 0) != 0)
+        {
+            HWND existing = reinterpret_cast<HWND>(InterlockedCompareExchangePointer(
+                reinterpret_cast<PVOID*>(&g_debugWindow), nullptr, nullptr));
+            if (existing)
+            {
+                ShowWindow(existing, SW_RESTORE);
+                SetForegroundWindow(existing);
+            }
             return;
-        InitializeCriticalSection(&g_debugLock);
-        g_debugLockInitialized = true;
-        CreateThread(nullptr, 0, DebugWindowThread, nullptr, 0, nullptr);
+        }
+        if (!g_debugLockInitialized)
+        {
+            InitializeCriticalSection(&g_debugLock);
+            g_debugLockInitialized = true;
+        }
+
+        wchar_t mutexName[96] = {};
+        swprintf_s(mutexName, ARRAYSIZE(mutexName),
+            L"Local\\WSC3UiDebugWindow_%lu", GetCurrentProcessId());
+        HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, mutexName);
+        if (!instanceMutex)
+        {
+            InterlockedExchange(&g_debugWindowStartState, 0);
+            return;
+        }
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            CloseHandle(instanceMutex);
+            InterlockedExchange(&g_debugWindowStartState, 0);
+            HWND existing = FindWindowW(L"Wsc3UiDebugWindow", nullptr);
+            if (existing)
+            {
+                ShowWindow(existing, SW_RESTORE);
+                SetForegroundWindow(existing);
+            }
+            return;
+        }
+        g_debugWindowInstanceMutex = instanceMutex;
+        HANDLE thread = CreateThread(nullptr, 0, DebugWindowThread, nullptr, 0, nullptr);
+        if (!thread)
+        {
+            CloseHandle(g_debugWindowInstanceMutex);
+            g_debugWindowInstanceMutex = nullptr;
+            InterlockedExchange(&g_debugWindowStartState, 0);
+            return;
+        }
+        CloseHandle(thread);
     }
 
     void PublishDebugSnapshot(LPCWSTR text, int count, LPRECT rect, UINT format,
@@ -1808,8 +1893,8 @@ namespace
             const SourceTrackingStats stats = GetSourceTrackingStats();
             wchar_t status[256] = {};
             swprintf_s(status, ARRAYSIZE(status),
-                L"\r\ntracking: handles=%lu mappings=%lu views=%lu snapshots=%lu bytes=%llu",
-                stats.handles, stats.mappings, stats.views, stats.snapshots,
+                L"\r\ntracking: enabled=%d handles=%lu mappings=%lu views=%lu snapshots=%lu bytes=%llu",
+                stats.enabled ? 1 : 0, stats.handles, stats.mappings, stats.views, stats.snapshots,
                 stats.cachedBytes);
             source += status;
         }
@@ -1886,7 +1971,9 @@ namespace
     {
         if (!g_multiByteToWideChar)
             return 0;
-        if (g_forceSystemCp932 && codePage == CP_ACP)
+        const bool tunerCp932 = g_layoutTunerEnabled &&
+            LayoutTunerGetSnapshot().forceCp932;
+        if ((g_forceSystemCp932 || tunerCp932) && codePage == CP_ACP)
             codePage = 932;
         if (g_patchOnly && g_patchTextCodePage == 936 &&
             (codePage == CP_ACP || codePage == 932) &&
@@ -1929,49 +2016,6 @@ namespace
         return ConvertTextCodePage(g_patchTextCodePage, text, count, output, outputCount);
     }
 
-    void NormalizeKnownPatchText(LPWSTR text, int capacity)
-    {
-        if (!text || capacity <= 0)
-            return;
-
-        // One config-help entry is assembled from adjacent translated fields
-        // and currently contains this duplicated tail.  Remove only the
-        // confirmed duplicate; all other text remains untouched.
-        const wchar_t* duplicate = L"\u8BBE\u4E3A\u5219\u4F1A\u4F7F\u8F6E\u5ED3\u66F4\u6E05\u6670\u3002";
-        wchar_t* match = wcsstr(text, duplicate);
-        if (match)
-            *match = L'\0';
-
-        // The rate.dat evaluation records use a long run of full-width
-        // spaces after each evaluation heading to force the following body
-        // text onto a separate Japanese line.  Reflowing the whole paragraph
-        // with the translated font can otherwise fit that body on the same
-        // line.  Convert only this confirmed heading format to an explicit
-        // line break; ordinary full-width spaces remain unchanged.
-        const wchar_t* headingPrefix = L"\u226A\u8A2D\u8A08\u8A55\u4FA1\u8005\uFF1A";
-        const wchar_t headingEnd = L'\u226B';
-        const wchar_t fullWidthSpace = L'\u3000';
-        const size_t prefixLength = wcslen(headingPrefix);
-        wchar_t* search = text;
-        while ((search = wcsstr(search, headingPrefix)) != nullptr)
-        {
-            wchar_t* marker = wcschr(search + prefixLength, headingEnd);
-            if (!marker)
-                break;
-            wchar_t* firstSpace = marker + 1;
-            wchar_t* afterSpaces = firstSpace;
-            while (*afterSpaces == fullWidthSpace)
-                ++afterSpaces;
-            if (afterSpaces - firstSpace >= 4)
-            {
-                *firstSpace = L'\n';
-                wmemmove(firstSpace + 1, afterSpaces,
-                    wcslen(afterSpaces) + 1);
-            }
-            search = marker + 1;
-        }
-    }
-
     void CachePatchParagraph(LPCSTR sourceBytes, int sourceCount,
         LPCWSTR original, int originalCount, LPCWSTR replacement,
         int replacementCount, HDC dc, LPRECT rect, UINT format,
@@ -2012,14 +2056,12 @@ namespace
     int WINAPI HookDrawTextPatch(HDC dc, LPCSTR text, int count, LPRECT rect,
         UINT format)
     {
-        if (InterlockedCompareExchange(&g_originalNullGuardRetryPending, 0, 0) != 0 &&
-            ApplyOriginalNullGuard(true, true))
-        {
-            InterlockedExchange(&g_originalNullGuardRetryPending, 0);
-        }
+#ifndef WSC3_MINIMAL_RELEASE
         InstallShipLookupHook();
-        if (g_patchTrace)
-            log("[PATCHTRACE][A] count=%d format=0x%08X width=%ld top=%ld\n", count, format,
+#endif
+        if (!rect || ((rect->right - rect->left != 972) &&
+            (!(format & DT_CALCRECT) || count < 30 || count % 60 == 0)))
+            WSC3_PATCH_TRACE("[PATCHTRACE][A] count=%d format=0x%08X width=%ld top=%ld\n", count, format,
                 rect ? rect->right - rect->left : -1L, rect ? rect->top : -1L);
         const uintptr_t callerAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
         const int actualCount = count < 0
@@ -2029,7 +2071,6 @@ namespace
         if (convertedCount <= 0 || !g_drawTextW)
             return g_drawTextA ? g_drawTextA(dc, text, count, rect, format) : 0;
         const uint32_t convertedAliasKey = HashWideText(converted, convertedCount);
-        NormalizeKnownPatchText(converted, ARRAYSIZE(converted));
         convertedCount = lstrlenW(converted);
         wchar_t originalText[8192] = {};
         UINT debugCodePage = static_cast<UINT>(InterlockedCompareExchange(
@@ -2071,13 +2112,15 @@ namespace
             converted[copy] = L'\0';
             convertedCount = copy;
         }
-        // Apply the confirmed rate.dat heading layout to translated text as
-        // well as the original Japanese text.
-        NormalizeKnownPatchText(converted, ARRAYSIZE(converted));
-        convertedCount = lstrlenW(converted);
+        // The full Debug build can keep the normal translation path while
+        // applying the live layout profile to the game's original A-side
+        // paragraph measurement call.
+        TryApplyLayoutTunerMeasure(dc, text, count, rect, format, callerAddress);
 
+#ifndef WSC3_MINIMAL_RELEASE
         CaptureShipTextA(text, actualCount, rect, format, callerAddress,
             originalText, originalCount, converted, convertedCount, originalKey);
+#endif
 
         int replayResult = 0;
         if (ReplayHistoricalPatchParagraph(dc, text, actualCount, rect, format,
@@ -2092,17 +2135,15 @@ namespace
             {
                 if (g_patchParagraphPending)
                 {
-                    if (g_patchTrace)
-                        log("[PATCHTRACE][A] reflow cached=%d\n", g_patchParagraphCount);
+                    WSC3_PATCH_TRACE("[PATCHTRACE][A] reflow cached=%d\n", g_patchParagraphCount);
                     RECT expanded = *rect;
                     expanded.bottom = expanded.top + 512;
                     g_patchParagraphPending = false;
                     g_patchParagraphDrawn = true;
-                    if (g_patchTrace)
-                        log("[PATCHTRACE][A] reflow_rect l=%ld t=%ld r=%ld b=%ld text=\"%s\"\n",
+                    WSC3_PATCH_TRACE("[PATCHTRACE][A] reflow_rect l=%ld t=%ld r=%ld b=%ld text=\"%s\"\n",
                             expanded.left, expanded.top, expanded.right, expanded.bottom,
                             CopyWideText(g_patchParagraph, g_patchParagraphCount).c_str());
-                    PublishDebugSnapshot(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
+                    WSC3_PUBLISH_DEBUG_SNAPSHOT(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
                         &expanded, format,
                         3, g_patchParagraphKey, g_patchParagraphSourceBytes.data(),
                         static_cast<int>(g_patchParagraphSourceBytes.size()));
@@ -2141,33 +2182,29 @@ namespace
             CachePatchParagraph(text, actualCount, originalText, originalCount,
                 converted, convertedCount, dc, rect, format, requestedWidth);
             g_patchParagraphKey = originalKey;
-            PublishDebugSnapshot(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
+            WSC3_PUBLISH_DEBUG_SNAPSHOT(g_patchOriginalParagraph, g_patchOriginalParagraphCount,
                 rect, format,
                 1, originalKey, g_patchParagraphSourceBytes.data(),
                 static_cast<int>(g_patchParagraphSourceBytes.size()));
-            if (g_patchTrace)
-                log("[PATCHTRACE][A] cache=%d requested=%ld measured=%ld text=\"%s\"\n",
+            if (actualCount < 30 || actualCount % 60 == 0)
+                WSC3_PATCH_TRACE("[PATCHTRACE][A] cache=%d requested=%ld measured=%ld text=\"%s\"\n",
                     g_patchParagraphCount,
                     requestedWidth, rect->right - rect->left,
                     CopyWideText(g_patchParagraph, g_patchParagraphCount).c_str());
             return result;
         }
 
-        PublishDebugSnapshot(originalText, originalCount, rect, format,
+        WSC3_PUBLISH_DEBUG_SNAPSHOT(originalText, originalCount, rect, format,
             (format & DT_WORDBREAK) ? 2 : 0, originalKey, text, actualCount);
         return g_drawTextW(dc, converted, convertedCount, rect, format);
     }
 
     int WINAPI HookDrawTextWPatch(HDC dc, LPCWSTR text, int count, LPRECT rect, UINT format)
     {
-        if (InterlockedCompareExchange(&g_originalNullGuardRetryPending, 0, 0) != 0 &&
-            ApplyOriginalNullGuard(true, true))
-        {
-            InterlockedExchange(&g_originalNullGuardRetryPending, 0);
-        }
+#ifndef WSC3_MINIMAL_RELEASE
         InstallShipLookupHook();
-        if (g_patchTrace)
-            log("[PATCHTRACE][W] count=%d format=0x%08X width=%ld top=%ld\n", count, format,
+#endif
+        WSC3_PATCH_TRACE("[PATCHTRACE][W] count=%d format=0x%08X width=%ld top=%ld\n", count, format,
                 rect ? rect->right - rect->left : -1L, rect ? rect->top : -1L);
         if (!g_drawTextW)
             return 0;
@@ -2215,7 +2252,7 @@ namespace
                     static_cast<int>(sourceBytes.size()), originalText.data(),
                     actualCount, renderedText, renderedCount, dc, rect, format,
                     requestedWidth);
-            PublishDebugSnapshot(originalText.c_str(), actualCount, rect, format,
+            WSC3_PUBLISH_DEBUG_SNAPSHOT(originalText.c_str(), actualCount, rect, format,
                 1, originalKey, sourceBytes.data(),
                 static_cast<int>(sourceBytes.size()));
             return result;
@@ -2229,17 +2266,15 @@ namespace
             {
                 if (g_patchParagraphPending)
                 {
-                    if (g_patchTrace)
-                        log("[PATCHTRACE][W] reflow cached=%d\n", g_patchParagraphCount);
+                    WSC3_PATCH_TRACE("[PATCHTRACE][W] reflow cached=%d\n", g_patchParagraphCount);
                     RECT expanded = *rect;
                     expanded.bottom = expanded.top + 512;
                     g_patchParagraphPending = false;
                     g_patchParagraphDrawn = true;
-                    if (g_patchTrace)
-                        log("[PATCHTRACE][W] reflow_rect l=%ld t=%ld r=%ld b=%ld text=\"%s\"\n",
+                    WSC3_PATCH_TRACE("[PATCHTRACE][W] reflow_rect l=%ld t=%ld r=%ld b=%ld text=\"%s\"\n",
                             expanded.left, expanded.top, expanded.right, expanded.bottom,
                             CopyWideText(g_patchParagraph, g_patchParagraphCount).c_str());
-                    PublishDebugSnapshot(g_patchOriginalParagraph,
+                    WSC3_PUBLISH_DEBUG_SNAPSHOT(g_patchOriginalParagraph,
                         g_patchOriginalParagraphCount, &expanded, format, 3,
                         g_patchParagraphKey, g_patchParagraphSourceBytes.data(),
                         static_cast<int>(g_patchParagraphSourceBytes.size()));
@@ -2251,7 +2286,7 @@ namespace
             else if (g_patchParagraphDrawn)
                 return 0;
         }
-        PublishDebugSnapshot(originalText.c_str(), actualCount, rect, format,
+        WSC3_PUBLISH_DEBUG_SNAPSHOT(originalText.c_str(), actualCount, rect, format,
             (format & DT_WORDBREAK) ? 2 : 0, originalKey, sourceBytes.data(),
             static_cast<int>(sourceBytes.size()));
         return g_drawTextW(dc, renderedText, renderedCount, rect, format);
@@ -2269,11 +2304,37 @@ namespace
             font->lfWidth = (font->lfWidth * scale) / 100;
     }
 
+    bool GetLayoutTunerFontProfile(int height, LayoutTunerFontProfile* profile)
+    {
+        if (!g_layoutTunerEnabled || !profile)
+            return false;
+        const LayoutTunerSnapshot snapshot = LayoutTunerGetSnapshot();
+        const int index = LayoutTunerFontIndexForHeight(height);
+        if (index < 0 || !snapshot.fonts[index].enabled)
+            return false;
+        *profile = snapshot.fonts[index];
+        return true;
+    }
+
     HFONT WINAPI HookCreateFontA(int height, int width, int escapement, int orientation,
         int weight, DWORD italic, DWORD underline, DWORD strikeOut, DWORD charSet,
         DWORD outputPrecision, DWORD clipPrecision, DWORD quality, DWORD pitchAndFamily,
         LPCSTR faceName)
     {
+        if (g_layoutTunerEnabled && charSet == SHIFTJIS_CHARSET && width == 0)
+        {
+            LayoutTunerFontProfile profile = {};
+            if (GetLayoutTunerFontProfile(height, &profile) && profile.lfWidth > 0)
+                width = profile.lfWidth;
+        }
+        else if (g_forceXpTextMetrics && charSet == SHIFTJIS_CHARSET && width == 0)
+        {
+            const int absoluteHeight = height < 0 ? -height : height;
+            if (absoluteHeight == 12 || absoluteHeight == 13)
+                width = 6;
+            else if (absoluteHeight == 28)
+                width = 15;
+        }
         if (g_narrowTargetFont && charSet == SHIFTJIS_CHARSET)
         {
             const int scale = g_targetFontScalePercent > 0 ? g_targetFontScalePercent : 100;
@@ -2292,6 +2353,20 @@ namespace
         if (!input)
             return g_createFontIndirectA(input);
         LOGFONTA font = *input;
+        if (g_layoutTunerEnabled && font.lfCharSet == SHIFTJIS_CHARSET && font.lfWidth == 0)
+        {
+            LayoutTunerFontProfile profile = {};
+            if (GetLayoutTunerFontProfile(font.lfHeight, &profile) && profile.lfWidth > 0)
+                font.lfWidth = profile.lfWidth;
+        }
+        else if (g_forceXpTextMetrics && font.lfCharSet == SHIFTJIS_CHARSET && font.lfWidth == 0)
+        {
+            const int absoluteHeight = font.lfHeight < 0 ? -font.lfHeight : font.lfHeight;
+            if (absoluteHeight == 12 || absoluteHeight == 13)
+                font.lfWidth = 6;
+            else if (absoluteHeight == 28)
+                font.lfWidth = 15;
+        }
         ScaleTargetLogfont(&font);
         return g_createFontIndirectA(&font);
     }
@@ -2420,6 +2495,8 @@ namespace
 
     UINT WINAPI HookGetACP()
     {
+        if (g_layoutTunerEnabled)
+            return LayoutTunerGetSnapshot().forceCp932 ? 932 : (g_getACP ? g_getACP() : 936);
         if (g_forceSystemCp932)
             return 932;
         return g_getACP ? g_getACP() : 936;
@@ -2427,6 +2504,8 @@ namespace
 
     UINT WINAPI HookGetOEMCP()
     {
+        if (g_layoutTunerEnabled)
+            return LayoutTunerGetSnapshot().forceCp932 ? 932 : (g_getOEMCP ? g_getOEMCP() : 936);
         if (g_forceSystemCp932)
             return 932;
         return g_getOEMCP ? g_getOEMCP() : 936;
@@ -2473,15 +2552,192 @@ namespace
         return result;
     }
 
+    void ScaleXpTextExtentA(HDC dc, LPSIZE size);
+
     BOOL WINAPI HookGetTextExtentPoint32A(HDC dc, LPCSTR text, int count, LPSIZE size)
     {
         BOOL result = g_getTextExtentA(dc, text, count, size);
+        if (result && size)
+            ScaleXpTextExtentA(dc, size);
         if (g_logText && result && size && !g_inHook)
         {
             g_inHook = true;
             log("[UIDIAG][GetTextExtentPoint32A] count=%d cx=%ld cy=%ld text_utf8=\"%s\"\n",
                 count, size->cx, size->cy, CopyAnsiText(text, count).c_str());
             g_inHook = false;
+        }
+        return result;
+    }
+
+    void ScaleXpTextExtentA(HDC dc, LPSIZE size)
+    {
+        if (!g_forceXpTextMetrics || !size || !g_getTextMetricsA)
+            return;
+        TEXTMETRICA metrics = {};
+        if (!g_getTextMetricsA(dc, &metrics) || metrics.tmCharSet != SHIFTJIS_CHARSET ||
+            metrics.tmAveCharWidth <= 0)
+            return;
+
+        int targetAverage = 0;
+        if (g_layoutTunerEnabled)
+        {
+            const LayoutTunerSnapshot snapshot = LayoutTunerGetSnapshot();
+            if (!snapshot.paragraphMeasure)
+                return;
+            const int index = LayoutTunerFontIndexForHeight(metrics.tmHeight);
+            if (index >= 0 && snapshot.fonts[index].enabled)
+                targetAverage = snapshot.fonts[index].averageWidth;
+        }
+        else
+        {
+            if (metrics.tmHeight == 12 || metrics.tmHeight == 13)
+                targetAverage = 6;
+            else if (metrics.tmHeight == 28)
+                targetAverage = 15;
+            else if (metrics.tmHeight == 38)
+                targetAverage = 20;
+            else if (metrics.tmHeight == 76)
+                targetAverage = 39;
+        }
+        if (targetAverage > 0 && metrics.tmAveCharWidth != targetAverage)
+            size->cx = MulDiv(size->cx, targetAverage, metrics.tmAveCharWidth);
+    }
+
+    BOOL WINAPI HookGetTextMetricsA(HDC dc, LPTEXTMETRICA metrics)
+    {
+        BOOL result = g_getTextMetricsA ? g_getTextMetricsA(dc, metrics) : FALSE;
+        if (result && g_forceXpTextMetrics && metrics &&
+            metrics->tmCharSet == SHIFTJIS_CHARSET)
+        {
+            if (g_layoutTunerEnabled)
+            {
+                LayoutTunerFontProfile profile = {};
+                if (GetLayoutTunerFontProfile(metrics->tmHeight, &profile))
+                {
+                    metrics->tmAveCharWidth = profile.averageWidth;
+                    metrics->tmMaxCharWidth = profile.maxWidth;
+                }
+            }
+            else if (metrics->tmHeight == 12 || metrics->tmHeight == 13)
+            {
+                // Measured from the XP reference log for MS Gothic at the
+                // font sizes used by the game.
+                metrics->tmAveCharWidth = 6;
+                metrics->tmMaxCharWidth = 12;
+            }
+            else if (metrics->tmHeight == 28)
+            {
+                metrics->tmAveCharWidth = 15;
+                metrics->tmMaxCharWidth = 29;
+            }
+            else if (metrics->tmHeight == 38)
+            {
+                metrics->tmAveCharWidth = 20;
+                metrics->tmMaxCharWidth = 39;
+            }
+            else if (metrics->tmHeight == 76)
+            {
+                metrics->tmAveCharWidth = 39;
+                metrics->tmMaxCharWidth = 77;
+            }
+        }
+        return result;
+    }
+
+    bool TryApplyLayoutTunerMeasure(HDC dc, LPCSTR text, int count, LPRECT rect,
+        UINT format, uintptr_t callerAddress)
+    {
+        if (!g_layoutTunerEnabled || g_layoutTunerOnly ||
+            !LayoutTunerGetSnapshot().paragraphMeasure || !dc || !text ||
+            !rect || count <= 0 || callerAddress != kParagraphMeasureCaller ||
+            !(format & DT_CALCRECT) || !g_getTextMetricsA)
+            return false;
+
+        TEXTMETRICA metrics = {};
+        if (!HookGetTextMetricsA(dc, &metrics) ||
+            metrics.tmCharSet != SHIFTJIS_CHARSET || metrics.tmAveCharWidth <= 0)
+            return false;
+
+        const LONG tunerWidth = static_cast<LONG>(XpCp932Width::Measure(
+            text, count, metrics.tmAveCharWidth));
+        if (tunerWidth <= 0)
+            return false;
+        rect->right = rect->left + tunerWidth;
+        return true;
+    }
+
+    int WINAPI HookDrawTextXpTextMetricsA(HDC dc, LPCSTR text, int count,
+        LPRECT rect, UINT format)
+    {
+        const uintptr_t callerAddress = reinterpret_cast<uintptr_t>(_ReturnAddress());
+        const int actualCount = count < 0 ? (text ? lstrlenA(text) : 0) : count;
+        const bool paragraphMeasure = g_layoutTunerOnly
+            ? LayoutTunerGetSnapshot().paragraphMeasure
+            : g_forceXpTextMetrics;
+
+        if (g_layoutTunerOnly && paragraphMeasure && text && rect && actualCount > 0 &&
+            callerAddress == kParagraphMeasureCaller && (format & DT_CALCRECT) &&
+            g_getTextMetricsA)
+        {
+            TEXTMETRICA metrics = {};
+            if (HookGetTextMetricsA(dc, &metrics) &&
+                metrics.tmCharSet == SHIFTJIS_CHARSET && metrics.tmAveCharWidth > 0)
+            {
+                const LONG xpWidth = static_cast<LONG>(XpCp932Width::Measure(
+                    text, actualCount, metrics.tmAveCharWidth));
+                if (xpWidth > 0)
+                {
+                    RECT tunerRect = *rect;
+                    tunerRect.right = tunerRect.left + xpWidth;
+                    const int tunerResult = g_drawTextA(dc, text, count, &tunerRect, format);
+                    *rect = tunerRect;
+                    return tunerResult;
+                }
+            }
+        }
+
+        const int result = g_drawTextA(dc, text, count, rect, format);
+        if (!g_layoutTunerOnly && g_forceXpTextMetrics && callerAddress == kParagraphDrawCaller &&
+            dc && text && rect && actualCount > 0 && g_getTextExtentA &&
+            InterlockedIncrement(&g_xpDrawEvents) <= 5000)
+        {
+            SIZE extent = {};
+            TEXTMETRICA metrics = {};
+            if (g_getTextExtentA(dc, text, actualCount, &extent) &&
+                HookGetTextMetricsA(dc, &metrics))
+            {
+                log("[UIDIAG][XPDraw] count=%d format=0x%08X extentWidth=%ld extentHeight=%ld rectWidth=%ld rectHeight=%ld avgWidth=%ld maxWidth=%ld height=%ld\n",
+                    actualCount, format, extent.cx, extent.cy,
+                    rect->right - rect->left, rect->bottom - rect->top,
+                    metrics.tmAveCharWidth, metrics.tmMaxCharWidth, metrics.tmHeight);
+            }
+        }
+        if (!paragraphMeasure || !text || !rect ||
+            callerAddress != kParagraphMeasureCaller ||
+            !(format & DT_CALCRECT))
+            return result;
+
+        if (actualCount <= 0 || !g_getTextMetricsA)
+            return result;
+
+        TEXTMETRICA metrics = {};
+        if (!HookGetTextMetricsA(dc, &metrics) ||
+            metrics.tmCharSet != SHIFTJIS_CHARSET || metrics.tmAveCharWidth <= 0)
+            return result;
+
+        const LONG xpWidth = static_cast<LONG>(XpCp932Width::Measure(
+            text, actualCount, metrics.tmAveCharWidth));
+        if (xpWidth > 0)
+        {
+            const LONG originalWidth = rect->right - rect->left;
+            rect->right = rect->left + xpWidth;
+            if (!g_layoutTunerOnly)
+            {
+                log("[UIDIAG][XPWidth] caller=0x%08lX count=%d originalWidth=%ld xpWidth=%ld avgWidth=%ld height=%ld\n",
+                    static_cast<unsigned long>(callerAddress), actualCount,
+                    originalWidth, xpWidth,
+                    metrics.tmAveCharWidth, metrics.tmHeight);
+            }
         }
         return result;
     }
@@ -2561,6 +2817,7 @@ namespace
         {
             rect->right = rect->left + 1148;
         }
+        TryApplyLayoutTunerMeasure(dc, text, count, rect, format, callerAddress);
         if (rect)
             submittedRect = *rect;
         int result = g_drawTextA(dc, text, count, rect, format);
@@ -2754,27 +3011,37 @@ namespace
                 behaviorFlags);
             g_inHook = false;
         }
-        return g_d3dCreateDevice(d3d, adapter, deviceType, window, behaviorFlags, params, device);
+        const HRESULT result = g_d3dCreateDevice(d3d, adapter, deviceType, window,
+            behaviorFlags, params, device);
+        return result;
     }
 
     IDirect3D8* WINAPI HookDirect3DCreate8(UINT sdkVersion)
     {
         IDirect3D8* d3d = g_direct3DCreate8(sdkVersion);
-        if (g_logMetrics && d3d && !g_d3dCreateDeviceHooked)
+        if ((g_logMetrics || g_d3d8FrameTrace) && d3d && !g_d3dCreateDeviceHooked)
         {
             void** vtable = *reinterpret_cast<void***>(d3d);
-            if (vtable && vtable[14] && MH_CreateHook(vtable[14],
-                reinterpret_cast<LPVOID>(&HookD3DCreateDevice),
-                reinterpret_cast<LPVOID*>(&g_d3dCreateDevice)) == MH_OK)
+            MH_STATUS createStatus = MH_ERROR_NOT_INITIALIZED;
+            MH_STATUS enableStatus = MH_ERROR_NOT_INITIALIZED;
+            if (vtable && vtable[15])
+            {
+                createStatus = MH_CreateHook(vtable[15],
+                    reinterpret_cast<LPVOID>(&HookD3DCreateDevice),
+                    reinterpret_cast<LPVOID*>(&g_d3dCreateDevice));
+                if (createStatus == MH_OK)
+                    enableStatus = MH_EnableHook(vtable[15]);
+            }
+            if (createStatus == MH_OK && enableStatus == MH_OK)
             {
                 g_d3dCreateDeviceHooked = true;
-                log("[UIDIAG][Direct3DCreate8] sdk=%u interface=%p CreateDeviceHooked=1\n",
-                    sdkVersion, d3d);
+                log("[UIDIAG][Direct3DCreate8] sdk=%u interface=%p CreateDeviceHooked=1 create=%d enable=%d\n",
+                    sdkVersion, d3d, createStatus, enableStatus);
             }
             else
             {
-                log("[UIDIAG][Direct3DCreate8] sdk=%u interface=%p CreateDeviceHooked=0\n",
-                    sdkVersion, d3d);
+                log("[UIDIAG][Direct3DCreate8] sdk=%u interface=%p CreateDeviceHooked=0 create=%d enable=%d\n",
+                    sdkVersion, d3d, createStatus, enableStatus);
             }
         }
         return d3d;
@@ -2792,8 +3059,28 @@ namespace
     }
 }
 
+void SetSourceTrackingEnabled(bool enabled)
+{
+    InterlockedExchange(&g_sourceTrackingEnabled, enabled ? 1 : 0);
+    if (!enabled)
+        ClearSourceTrackingCache();
+}
+
+void ClearSourceTrackingCache()
+{
+    AcquireSRWLockExclusive(&g_sourceLock);
+    g_sourceHandles.clear();
+    g_sourceMappings.clear();
+    g_sourceViews.clear();
+    g_sourceSnapshots.clear();
+    g_sourceCacheBytes = 0;
+    ReleaseSRWLockExclusive(&g_sourceLock);
+}
+
 void TrackSourceFileHandle(HANDLE handle, LPCWSTR path)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     if (!handle || handle == INVALID_HANDLE_VALUE || !path ||
         GetFileType(handle) != FILE_TYPE_DISK)
         return;
@@ -2809,6 +3096,8 @@ void TrackSourceFileHandle(HANDLE handle, LPCWSTR path)
 
 void TrackSourceFileHandleA(HANDLE handle, LPCSTR path)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     if (!path)
         return;
     UINT codePage = CP_ACP;
@@ -2828,6 +3117,8 @@ void TrackSourceFileHandleA(HANDLE handle, LPCSTR path)
 
 void TrackSourceFileClose(HANDLE handle)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     if (!handle || handle == INVALID_HANDLE_VALUE)
         return;
     AcquireSRWLockExclusive(&g_sourceLock);
@@ -2837,6 +3128,8 @@ void TrackSourceFileClose(HANDLE handle)
 
 void TrackSourceMappingClose(HANDLE handle)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     if (!handle || handle == INVALID_HANDLE_VALUE)
         return;
     AcquireSRWLockExclusive(&g_sourceLock);
@@ -2848,6 +3141,8 @@ void TrackSourceMappingClose(HANDLE handle)
 // second disk read, so the original game resource remains untouched.
 void TrackSourceFileMapping(HANDLE mapping, HANDLE file, ULONGLONG mappingSize)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     if (!mapping || mapping == INVALID_HANDLE_VALUE || !file ||
         file == INVALID_HANDLE_VALUE)
         return;
@@ -2903,6 +3198,8 @@ bool CopyMappedViewBytes(LPCVOID view, char* destination, size_t length)
 void TrackSourceMappedView(LPVOID view, HANDLE mapping, ULONGLONG offset,
     SIZE_T bytesToMap)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     if (!view || !mapping)
         return;
     SourceMappedViewContext viewContext;
@@ -2922,8 +3219,10 @@ void TrackSourceMappedView(LPVOID view, HANDLE mapping, ULONGLONG offset,
     viewContext.length = available;
     g_sourceViews[view] = viewContext;
 
-    const size_t copyLength = available < kSourcePerFileLimit
-        ? static_cast<size_t>(available) : kSourcePerFileLimit;
+    const size_t copyLength = IsSourceTrackingEnabledInternal()
+        ? (available < kSourcePerFileLimit
+            ? static_cast<size_t>(available) : kSourcePerFileLimit)
+        : 0;
     if (copyLength > 0)
     {
         std::string copied(copyLength, '\0');
@@ -2936,6 +3235,8 @@ void TrackSourceMappedView(LPVOID view, HANDLE mapping, ULONGLONG offset,
 
 void TrackSourceUnmappedView(LPCVOID view)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     if (!view)
         return;
     AcquireSRWLockExclusive(&g_sourceLock);
@@ -2946,6 +3247,7 @@ void TrackSourceUnmappedView(LPCVOID view)
 SourceTrackingStats GetSourceTrackingStats()
 {
     SourceTrackingStats stats;
+    stats.enabled = IsSourceTrackingEnabledInternal();
     AcquireSRWLockShared(&g_sourceLock);
     stats.handles = static_cast<DWORD>(g_sourceHandles.size());
     stats.mappings = static_cast<DWORD>(g_sourceMappings.size());
@@ -2958,6 +3260,8 @@ SourceTrackingStats GetSourceTrackingStats()
 
 void TrackSourceFilePointer(HANDLE handle, ULONGLONG newPosition, bool known)
 {
+    if (!IsSourceTrackingEnabledInternal())
+        return;
     AcquireSRWLockExclusive(&g_sourceLock);
     auto found = g_sourceHandles.find(handle);
     if (found != g_sourceHandles.end())
@@ -2971,7 +3275,7 @@ void TrackSourceFilePointer(HANDLE handle, ULONGLONG newPosition, bool known)
 void TrackSourceRead(HANDLE handle, LPCVOID buffer, DWORD bytesRead,
     const OVERLAPPED* overlapped)
 {
-    if (!buffer || bytesRead == 0)
+    if (!IsSourceTrackingEnabledInternal() || !buffer || bytesRead == 0)
         return;
     AcquireSRWLockExclusive(&g_sourceLock);
     auto found = g_sourceHandles.find(handle);
@@ -3004,12 +3308,54 @@ void TrackSourceRead(HANDLE handle, LPCVOID buffer, DWORD bytesRead,
 bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnly,
     bool doubleTargetWidth, bool narrowTargetFont, int targetFontScalePercent, bool reflowTargetText,
     bool patchOnly, bool patchTrace, bool debugWindow, UINT patchTextCodePage,
-    bool originalNullGuard, bool captureShipData, bool forceSystemCp932)
+    bool captureShipData, bool forceSystemCp932,
+    bool d3d8FrameTrace, bool layoutTunerWindow, bool sourceTracking)
 {
+#ifdef WSC3_MINIMAL_RELEASE
+    (void)logText;
+    (void)logMetrics;
+    (void)targetTextWidthOnly;
+    (void)doubleTargetWidth;
+    (void)narrowTargetFont;
+    (void)targetFontScalePercent;
+    (void)patchOnly;
+    (void)patchTrace;
+    (void)debugWindow;
+    (void)captureShipData;
+    (void)d3d8FrameTrace;
+    (void)layoutTunerWindow;
+    (void)sourceTracking;
+    g_patchOnly = true;
+    g_patchTrace = false;
+    g_forceSystemCp932 = true;
+    g_patchTextCodePage = 932;
+    g_reflowTargetText = true;
+    ResolveTranslationPath();
+    LoadTranslations();
+
+    InstallFrameLimiterFromGameIni();
+
+    bool ok = true;
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    g_drawTextW = user32 ? reinterpret_cast<DrawTextWFn>(GetProcAddress(user32, "DrawTextW")) : nullptr;
+    ok = AddApiHook(L"user32", "DrawTextA", (LPVOID)&HookDrawTextPatch,
+        reinterpret_cast<LPVOID*>(&g_drawTextA)) && ok;
+    ok = AddApiHook(L"user32", "DrawTextW", (LPVOID)&HookDrawTextWPatch,
+        reinterpret_cast<LPVOID*>(&g_drawTextW)) && ok;
+    ok = AddApiHook(L"kernel32", "MultiByteToWideChar", (LPVOID)&HookMultiByteToWideChar,
+        reinterpret_cast<LPVOID*>(&g_multiByteToWideChar)) && ok;
+    ok = AddApiHook(L"kernel32", "GetACP", (LPVOID)&HookGetACP,
+        reinterpret_cast<LPVOID*>(&g_getACP)) && ok;
+    ok = AddApiHook(L"kernel32", "GetOEMCP", (LPVOID)&HookGetOEMCP,
+        reinterpret_cast<LPVOID*>(&g_getOEMCP)) && ok;
+    return ok;
+#else
     g_patchOnly = patchOnly;
     g_patchTrace = patchTrace;
     g_captureShipData = captureShipData;
     g_forceSystemCp932 = forceSystemCp932;
+    g_d3d8FrameTrace = false;
+    (void)d3d8FrameTrace;
     g_patchTextCodePage = patchTextCodePage == 932 ? 932 : 936;
     g_debugWindowEnabled = debugWindow;
     g_logText = patchOnly ? false : logText;
@@ -3019,19 +3365,20 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
     g_narrowTargetFont = narrowTargetFont;
     g_targetFontScalePercent = targetFontScalePercent > 0 ? targetFontScalePercent : 100;
     g_reflowTargetText = reflowTargetText;
-
-    InterlockedExchange(&g_originalNullGuardRetryPending, originalNullGuard ? 1 : 0);
-    if (originalNullGuard && ApplyOriginalNullGuard(true))
-        InterlockedExchange(&g_originalNullGuardRetryPending, 0);
+    g_layoutTunerEnabled = false;
+    g_layoutTunerOnly = false;
+    SetSourceTrackingEnabled(sourceTracking && debugWindow);
 
     ResolveTranslationPath();
     LoadTranslations();
+
+    InstallFrameLimiterFromGameIni();
 
     if (g_debugWindowEnabled)
         StartDebugWindow();
 
     bool ok = true;
-    if (!g_patchOnly && g_logMetrics)
+    if (!g_patchOnly && (g_logMetrics || g_d3d8FrameTrace))
     {
         ok = AddApiHook(L"user32", "GetSystemMetrics", (LPVOID)&HookGetSystemMetrics,
             reinterpret_cast<LPVOID*>(&g_getSystemMetrics)) && ok;
@@ -3051,8 +3398,6 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
             reinterpret_cast<LPVOID*>(&g_setWindowExtEx)) && ok;
         ok = AddApiHook(L"gdi32", "SetViewportExtEx", (LPVOID)&HookSetViewportExtEx,
             reinterpret_cast<LPVOID*>(&g_setViewportExtEx)) && ok;
-        ok = AddApiHook(L"d3d8", "Direct3DCreate8", (LPVOID)&HookDirect3DCreate8,
-            reinterpret_cast<LPVOID*>(&g_direct3DCreate8)) && ok;
     }
 
     if (g_patchOnly)
@@ -3093,6 +3438,9 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
             reinterpret_cast<LPVOID*>(&g_drawTextW)) && ok;
     }
 
+    if (layoutTunerWindow)
+        ok = InstallLayoutTunerWindowHooks() && ok;
+
     if (!g_patchOnly)
     {
         log("[UIDIAG] installed text=%d metrics=%d targetWidthOnly=%d doubleWidth=%d narrowFont=%d fontScale=%d reflow=%d result=%d\n",
@@ -3100,5 +3448,102 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
             doubleTargetWidth ? 1 : 0, narrowTargetFont ? 1 : 0,
             g_targetFontScalePercent, reflowTargetText ? 1 : 0, ok ? 1 : 0);
     }
+    return ok;
+#endif
+}
+
+bool InstallCp932CompatibilityHooks()
+{
+    g_forceSystemCp932 = true;
+    bool ok = true;
+    ok = AddApiHook(L"kernel32", "GetACP", (LPVOID)&HookGetACP,
+        reinterpret_cast<LPVOID*>(&g_getACP)) && ok;
+    ok = AddApiHook(L"kernel32", "GetOEMCP", (LPVOID)&HookGetOEMCP,
+        reinterpret_cast<LPVOID*>(&g_getOEMCP)) && ok;
+    return ok;
+}
+
+bool InstallCp932XpTextMetricsHooks()
+{
+    g_forceSystemCp932 = true;
+    g_forceXpTextMetrics = true;
+    bool ok = true;
+    ok = AddApiHook(L"kernel32", "GetACP", (LPVOID)&HookGetACP,
+        reinterpret_cast<LPVOID*>(&g_getACP)) && ok;
+    ok = AddApiHook(L"kernel32", "GetOEMCP", (LPVOID)&HookGetOEMCP,
+        reinterpret_cast<LPVOID*>(&g_getOEMCP)) && ok;
+    ok = AddApiHook(L"gdi32", "GetTextMetricsA", (LPVOID)&HookGetTextMetricsA,
+        reinterpret_cast<LPVOID*>(&g_getTextMetricsA)) && ok;
+    ok = AddApiHook(L"gdi32", "GetTextExtentPoint32A", (LPVOID)&HookGetTextExtentPoint32A,
+        reinterpret_cast<LPVOID*>(&g_getTextExtentA)) && ok;
+    ok = AddApiHook(L"gdi32", "CreateFontA", (LPVOID)&HookCreateFontA,
+        reinterpret_cast<LPVOID*>(&g_createFontA)) && ok;
+    ok = AddApiHook(L"gdi32", "CreateFontIndirectA", (LPVOID)&HookCreateFontIndirectA,
+        reinterpret_cast<LPVOID*>(&g_createFontIndirectA)) && ok;
+    ok = AddApiHook(L"user32", "DrawTextA", (LPVOID)&HookDrawTextXpTextMetricsA,
+        reinterpret_cast<LPVOID*>(&g_drawTextA)) && ok;
+    log("[UIDIAG] CP932 XP text metrics-only hooks result=%d\n", ok ? 1 : 0);
+    return ok;
+}
+
+bool InstallLayoutTunerHooks()
+{
+    g_layoutTunerEnabled = true;
+    g_layoutTunerOnly = true;
+    g_forceSystemCp932 = true;
+    g_forceXpTextMetrics = true;
+    LayoutTunerInitialize();
+    bool ok = true;
+    ok = AddApiHook(L"kernel32", "GetACP", (LPVOID)&HookGetACP,
+        reinterpret_cast<LPVOID*>(&g_getACP)) && ok;
+    ok = AddApiHook(L"kernel32", "GetOEMCP", (LPVOID)&HookGetOEMCP,
+        reinterpret_cast<LPVOID*>(&g_getOEMCP)) && ok;
+    ok = AddApiHook(L"gdi32", "GetTextMetricsA", (LPVOID)&HookGetTextMetricsA,
+        reinterpret_cast<LPVOID*>(&g_getTextMetricsA)) && ok;
+    ok = AddApiHook(L"gdi32", "GetTextExtentPoint32A", (LPVOID)&HookGetTextExtentPoint32A,
+        reinterpret_cast<LPVOID*>(&g_getTextExtentA)) && ok;
+    ok = AddApiHook(L"gdi32", "CreateFontA", (LPVOID)&HookCreateFontA,
+        reinterpret_cast<LPVOID*>(&g_createFontA)) && ok;
+    ok = AddApiHook(L"gdi32", "CreateFontIndirectA", (LPVOID)&HookCreateFontIndirectA,
+        reinterpret_cast<LPVOID*>(&g_createFontIndirectA)) && ok;
+    ok = AddApiHook(L"user32", "DrawTextA", (LPVOID)&HookDrawTextXpTextMetricsA,
+        reinterpret_cast<LPVOID*>(&g_drawTextA)) && ok;
+    if (ok)
+        ok = LayoutTunerWindowStart(reinterpret_cast<HINSTANCE>(GetModuleHandleW(nullptr)));
+    return ok;
+}
+
+bool InstallLayoutTunerWindowHooks()
+{
+    g_layoutTunerEnabled = true;
+    g_layoutTunerOnly = false;
+    g_forceSystemCp932 = true;
+    g_forceXpTextMetrics = true;
+    LayoutTunerInitialize();
+
+    bool ok = true;
+    if (!g_getACP)
+        ok = AddApiHook(L"kernel32", "GetACP", (LPVOID)&HookGetACP,
+            reinterpret_cast<LPVOID*>(&g_getACP)) && ok;
+    if (!g_getOEMCP)
+        ok = AddApiHook(L"kernel32", "GetOEMCP", (LPVOID)&HookGetOEMCP,
+            reinterpret_cast<LPVOID*>(&g_getOEMCP)) && ok;
+    if (!g_getTextMetricsA)
+        ok = AddApiHook(L"gdi32", "GetTextMetricsA", (LPVOID)&HookGetTextMetricsA,
+            reinterpret_cast<LPVOID*>(&g_getTextMetricsA)) && ok;
+    if (!g_getTextExtentA)
+        ok = AddApiHook(L"gdi32", "GetTextExtentPoint32A", (LPVOID)&HookGetTextExtentPoint32A,
+            reinterpret_cast<LPVOID*>(&g_getTextExtentA)) && ok;
+    if (!g_createFontA)
+        ok = AddApiHook(L"gdi32", "CreateFontA", (LPVOID)&HookCreateFontA,
+            reinterpret_cast<LPVOID*>(&g_createFontA)) && ok;
+    if (!g_createFontIndirectA)
+        ok = AddApiHook(L"gdi32", "CreateFontIndirectA", (LPVOID)&HookCreateFontIndirectA,
+            reinterpret_cast<LPVOID*>(&g_createFontIndirectA)) && ok;
+    if (!g_drawTextA)
+        ok = AddApiHook(L"user32", "DrawTextA", (LPVOID)&HookDrawTextA,
+            reinterpret_cast<LPVOID*>(&g_drawTextA)) && ok;
+    if (ok)
+        ok = LayoutTunerWindowStart(reinterpret_cast<HINSTANCE>(GetModuleHandleW(nullptr)));
     return ok;
 }

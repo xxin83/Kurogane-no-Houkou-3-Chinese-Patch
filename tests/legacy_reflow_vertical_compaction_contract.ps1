@@ -12,7 +12,7 @@ if ($source -notmatch 'LONG MeasurePatchParagraphHeight\(') {
 
 $replay = [regex]::Match(
     $source,
-    '(?s)bool ReplayHistoricalPatchParagraph\(.*?\n    \}\n\n    void UpdateDebugControls'
+    '(?s)bool ReplayHistoricalPatchParagraph\(.*?\r?\n    \}\r?\n\r?\n    void UpdateDebugControls'
 ).Value
 if ([string]::IsNullOrEmpty($replay)) {
     throw 'Historical paragraph replay function was not found.'

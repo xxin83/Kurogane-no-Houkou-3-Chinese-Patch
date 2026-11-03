@@ -14,7 +14,6 @@
   "uiPatchOnly": true,
   "uiPatchTrace": false,
   "uiCaptureShipData": false,
-  "uiOriginalNullGuard": true,
   "uiDebugWindow": true,
   "uiTextEncoding": "cp932",
   "uiForceCp932": true

@@ -38,3 +38,6 @@ metrics. They do not change API return values or patch the game:
 }
 ```
 
+Frame pacing is configured separately in the game directory's `debug.ini`:
+`[Common]` `FrameRate=60` is the default, and `FrameRate=0` disables it.
+

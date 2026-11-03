@@ -24,7 +24,7 @@ if ($source -notmatch 'g_patchParagraphDeadline') {
 if ($source -notmatch 'g_patchParagraphDc|g_patchParagraphLeft') {
     throw 'Scheme-two paragraph port must bind replay to the original drawing context.'
 }
-$wHook = [regex]::Match($source, '(?s)int WINAPI HookDrawTextWPatch\(.*?\n    \}\n\n    void ScaleTargetLogfont').Value
+$wHook = [regex]::Match($source, '(?s)int WINAPI HookDrawTextWPatch\(.*?\r?\n    \}\r?\n\r?\n    void ScaleTargetLogfont').Value
 if ($wHook -notmatch 'DT_CALCRECT') {
     throw 'Scheme-two paragraph port must cache paragraphs measured through DrawTextW.'
 }
