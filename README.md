@@ -38,11 +38,11 @@
 
     <游戏根目录>\\chinese\\translations.json
 
-游戏原始资源 `cg.bb3` 必须保留在：
+本次发布的修改版图片资源 `cg.bb3` 必须复制到：
 
     <游戏根目录>\\data\\stobj\\cg.bb3
 
-该原始资源不随公开补丁仓库发布，请使用自己的游戏安装文件。完整目录结构见
+仓库文件位于 `game-files\\data\\stobj\\cg.bb3`。完整目录结构见
 [游戏目录部署说明.md](游戏目录部署说明.md)。
 
 游戏运行版默认启用汉化、CP932 兼容和段落修正，无需 `version.json`；翻译内容仍从 `chinese\translations.json` 读取。此版本不包含翻译调试窗口或日志输出。
@@ -185,7 +185,7 @@ Release 构建定义 `WSC3_RELEASE_NO_LOGGING` 和 `WSC3_GAME_RELEASE`，移除�
 | `version.capture.json` | 已关闭日志的可部署配置示例 |
 | `debug.ini` | 帧率、Debug UI、来源追踪和排版调参开关模板 |
 | `game-files\\chinese\\translations.json` | 可直接部署到游戏目录的翻译表 |
-| `游戏目录部署说明.md` | 翻译表和游戏原始资源的目标路径说明 |
+| `游戏目录部署说明.md` | 翻译表和修改版 `cg.bb3` 的目标路径说明 |
 | `build-release.ps1` | 一键重建 Release DLL 并输出 SHA-256 |
 | `build-full-debug.ps1` | 一键重建完整版 Debug DLL 并输出 SHA-256 |
 | `更新说明-2026-10-25-干净版与调试UI.md` | 本版本改动、构建产物和回退信息 |
