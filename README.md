@@ -1,10 +1,10 @@
-# Valkyria Chronicles 3 中文化补丁
+# 钢铁的咆哮 3（Kurogane no Houkou 3）中文化补丁
 
-这是面向中文用户的 Valkyria Chronicles 3（WSC3，工程目录名为 `KH3`）运行时汉化补丁基准工程。
+这是面向中文用户的钢铁的咆哮 3（Kurogane no Houkou 3，WSC3，工程目录名为 `KH3`）运行时汉化补丁基准工程。
 
 ## 项目说明
 
-本仓库保存 Valkyria Chronicles 3（WSC3）运行时汉化补丁的基准源码。
+本仓库保存 Kurogane no Houkou 3（WSC3）运行时汉化补丁的基准源码。
 
 `dist/version.dll` 是现有运行版产物；`dist/version-debug.dll` 是带 Debug UI、来源
 追踪开关和 Win11 排版调参能力的完整版调试产物，需配合 `dist/debug.ini` 使用。
@@ -21,7 +21,6 @@
 - 游戏资源来源追踪与来源缓存清理；
 - XP 参考字体度量和 Win11 排版调参窗口；
 - 模板占位符的可选二次比对；
-- 100/200/300/400/500 条可选的调试历史缓存。
 
 完整复现说明请阅读：[运行时汉化-完整复现与维护说明.md](运行时汉化-完整复现与维护说明.md)。
 
@@ -35,13 +34,12 @@
 
     E:\\KH3\\chinese\\translations.json
 
-`version.json` 也放在游戏目录中，用于控制日志、汉化补丁和 Debug UI。
+游戏运行版默认启用汉化、CP932 兼容和段落修正，无需 `version.json`；翻译内容仍从 `chinese\translations.json` 读取。此版本不包含翻译调试窗口或日志输出。
 
 补丁默认限制 `EndScene` 调用频率为 60 次/秒。可在游戏目录的 `debug.ini` 中
 设置 `[Common]` 下的 `FrameRate=30` 或 `FrameRate=60`；`FrameRate=0` 关闭限速。
 支持 15～240，未设置或数值超出范围时默认 60。该数值控制的是 `EndScene`
 调用频率，实际画面帧率和游戏速度仍需在游戏中验证。
-
 完整版 Debug DLL 也从同一个 `debug.ini` 读取调试开关：
 
     WSC3DebugUI=1
@@ -54,11 +52,10 @@
 因为调试窗口或来源扫描增加游戏运行负担。仓库中的 `debug.ini` 是可直接复制
 到游戏目录的模板。
 
-现代中文 Windows 上还应启用进程内 CP932 兼容层。可将仓库中的
-`version.capture.json` 复制为游戏目录的 `version.json`；该示例已经关闭日志和舰船诊断追踪，并保留：
+现代中文 Windows 上，进程内 CP932 兼容层在完整版 Debug DLL 中默认启用。
+实现细节和维护步骤见 [帧率限制-实现与维护说明.md](帧率限制-实现与维护说明.md)。
 
-    "uiTextEncoding": "cp932",
-    "uiForceCp932": true
+现代中文 Windows 上，进程内 CP932 兼容层在游戏运行版中默认启用。
 
 SafeDisc 3 及以上版本通常会自动加载同目录下的 `version.dll`。部分 SafeDisc 2 游戏需要使用 `VersionInjector.exe` 注入；可以双击运行，也可以将游戏 EXE 拖到该程序上。
 
@@ -161,15 +158,14 @@ Win11 使用完整版 Debug DLL 的 `WSC3LayoutTuner=1` 开启排版调参窗口
 
     Get-ChildItem .\\tests\\*.ps1 | ForEach-Object { & $_.FullName }
 
-Release 构建默认定义 `WSC3_RELEASE_NO_LOGGING`，会在编译期移除 DLL 内的日志实现和
-日志初始化开销；Debug 构建仍保留日志，便于故障定位。构建和部署前请保存原 DLL。
+Release 构建定义 `WSC3_RELEASE_NO_LOGGING` 和 `WSC3_GAME_RELEASE`，移除日志与翻译调试 UI 的运行入口。构建和部署前请保存原 DLL。
 不要同时加载多个版本的 `version.dll` 或 `kh3_gbk.dll`。
 
 ## 重要文件
 
 | 文件 | 用途 |
 |---|---|
-| `src/UiDiag.cpp` | 编码转换、翻译表、Debug UI、文字 Hook、段落重排 |
+| `src/UiDiag.cpp` | 编码转换、翻译表、文字 Hook、段落重排 |
 | `src/version.cpp` | version.dll 代理、SafeDisc 初始化、配置读取和 Hook 安装 |
 | `tests/` | 段落补丁和 Hook ABI 契约测试 |
 | `运行时汉化-完整复现与维护说明.md` | 完整复现、维护和故障排查 |
@@ -181,6 +177,7 @@ Release 构建默认定义 `WSC3_RELEASE_NO_LOGGING`，会在编译期移除 DLL
 | `build-full-debug.ps1` | 一键重建完整版 Debug DLL 并输出 SHA-256 |
 | `更新说明-2026-10-25-干净版与调试UI.md` | 本版本改动、构建产物和回退信息 |
 | `更新说明-2026-11-03-debug.ini与XP-Win11排版.md` | 本次 debug.ini、XP 基线和 Win11 排版调参说明 |
+| `更新说明-2026-11-01-帧率限制与日常版.md` | 历史版本更新记录 |
 
 ## 安全和许可证
 
@@ -193,7 +190,7 @@ Release 构建默认定义 `WSC3_RELEASE_NO_LOGGING`，会在编译期移除 DLL
 <details>
 <summary>原 SafeDiscLoader2 英文资料（展开查看）</summary>
 
-## Valkyria Chronicles 3 Chinese patch baseline
+## Kurogane no Houkou 3 Chinese patch baseline
 
 This repository contains the WSC3/KH3 runtime translation patch. It preserves the SafeDiscLoader2 `version.dll` proxy and adds runtime CP932 text identity, Chinese translation lookup, `DrawTextA/W` interception, and the historical paragraph reflow compatibility path.
 

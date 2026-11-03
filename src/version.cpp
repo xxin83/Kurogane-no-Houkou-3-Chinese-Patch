@@ -12,6 +12,7 @@
 #include "MemHack.h"
 #include "Config.h"
 #include "UiDiag.h"
+#include "FrameLimiter.h"
 #include <ntddscsi.h>
 #include <map>
 #include <stdlib.h>
@@ -1267,7 +1268,6 @@ DWORD WINAPI Load(LPVOID lpParam)
 	const bool cp932EnvironmentOnly = config.GetBool("uiCp932EnvironmentOnly", false);
 	#ifdef WSC3_MINIMAL_RELEASE
 	const bool debugWindowEnabled = false;
-	const bool sourceTrackingEnabled = false;
 	#else
 	const bool debugWindowEnabled = isGameProcess && debugUiEnabled;
 	#endif
