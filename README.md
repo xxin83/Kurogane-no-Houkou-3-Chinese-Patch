@@ -57,9 +57,13 @@
     WSC3SourceTracking=0
     WSC3LayoutTuner=0
 
+完整版 Debug 始终应用已确认的 XP 字体度量参数；`WSC3LayoutTuner` 仅控制
+是否显示可交互的排版调参窗口。设置为 `0` 也会保留排版修正。
+
 这些 `[Common]` 项优先于 `version.json` 中对应的 UI 设置。将
 `WSC3DebugUI=0` 后，翻译、CP932 兼容、普通段落修补和帧率限制仍然运行，
-但不启动 Debug UI，也不安装来源追踪、调试记录和排版调参功能；这样不会
+但不启动 Debug UI、来源追踪、调试记录和排版调参窗口；已确认的 XP 字体度量
+修正仍会应用。这样不会
 因为调试窗口或来源扫描增加游戏运行负担。仓库中的 `debug.ini` 是可直接复制
 到游戏目录的模板。
 

@@ -3438,8 +3438,13 @@ bool InstallUiDiagnostics(bool logText, bool logMetrics, bool targetTextWidthOnl
             reinterpret_cast<LPVOID*>(&g_drawTextW)) && ok;
     }
 
+#ifdef WSC3_FULL_DEBUG
+    // Apply the saved XP profile even when the tuning window is hidden.
+    ok = InstallLayoutTunerWindowHooks(layoutTunerWindow) && ok;
+#else
     if (layoutTunerWindow)
-        ok = InstallLayoutTunerWindowHooks() && ok;
+        ok = InstallLayoutTunerWindowHooks(true) && ok;
+#endif
 
     if (!g_patchOnly)
     {
@@ -3513,7 +3518,7 @@ bool InstallLayoutTunerHooks()
     return ok;
 }
 
-bool InstallLayoutTunerWindowHooks()
+bool InstallLayoutTunerWindowHooks(bool showWindow)
 {
     g_layoutTunerEnabled = true;
     g_layoutTunerOnly = false;
@@ -3543,7 +3548,7 @@ bool InstallLayoutTunerWindowHooks()
     if (!g_drawTextA)
         ok = AddApiHook(L"user32", "DrawTextA", (LPVOID)&HookDrawTextA,
             reinterpret_cast<LPVOID*>(&g_drawTextA)) && ok;
-    if (ok)
+    if (ok && showWindow)
         ok = LayoutTunerWindowStart(reinterpret_cast<HINSTANCE>(GetModuleHandleW(nullptr)));
     return ok;
 }

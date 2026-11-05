@@ -25,7 +25,7 @@ bool InstallLayoutTunerHooks();
 
 // Full Debug build: keep all existing diagnostic/translation hooks and attach
 // the live layout tuner window/profile to the same hook chain.
-bool InstallLayoutTunerWindowHooks();
+bool InstallLayoutTunerWindowHooks(bool showWindow = true);
 
 // Runtime resource provenance hooks.  These functions only record bounded
 // read snapshots; they do not alter the file APIs or game data.
